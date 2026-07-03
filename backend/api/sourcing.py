@@ -106,6 +106,14 @@ async def _run_search_job(job_id: str, query: str, agent: object, structured: Op
     job = _SEARCH_JOBS[job_id]
     job.status = "running"
     _append_event(job, "queued", "已接收供应商研究任务，Agent 正在启动采购需求分析流程...", 5)
+    try:
+        save_sourcing_request_and_suppliers(
+        request_text=query,
+        requested_by=job.owner,
+        suppliers=[],
+    )
+    except Exception as e:
+        print(f"[sourcing] 保存请求失败: {e}")
 
     def progress(phase: str, message: str, percent: int) -> None:
         _append_event(job, phase, message, percent)
