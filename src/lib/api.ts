@@ -1,16 +1,10 @@
-// ---------------------------------------------------------------------------
 // HTTP API client — the single integration seam to the backend.
-//
 // Toggle: set VITE_API_BASE_URL (e.g. in .env.local or Vercel env).
-//   - NOT set  → `apiEnabled` is false → the app keeps using mock data /
-//                localStorage exactly as before (offline prototype mode).
+//   - NOT set  → `apiEnabled` is false → the app keeps using mock data / localStorage exactly as before (offline prototype mode).
 //   - set      → every data call goes to the real REST backend.
-//
 // Endpoints + payload shapes follow docs/PROJECT_TASKS.md (Lane D) and the
 // types in src/types.ts. Backend devs: make your API match this and the
 // frontend just works — no frontend changes needed.
-// ---------------------------------------------------------------------------
-
 import type {
   AuthUser,
   ComparisonItem,

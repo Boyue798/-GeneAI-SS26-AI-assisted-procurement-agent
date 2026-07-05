@@ -105,13 +105,21 @@ CREATE TABLE sourcing_session (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 候选供应商（网络搜索到的临时区，确认后转入正式 supplier 表）
+-- 注意：此表结构匹配 db_writer.py 的实际使用方式
 CREATE TABLE sourcing_candidate (
     id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    session_id   BIGINT NOT NULL REFERENCES sourcing_session(id) ON DELETE CASCADE,
-    supplier_id  BIGINT REFERENCES supplier(id) ON DELETE SET NULL,
-    relevance    NUMERIC(6,3),
-    quality_note TEXT,
-    is_incumbent BOOLEAN NOT NULL DEFAULT FALSE
+    name         TEXT NOT NULL,
+    origin       supplier_origin NOT NULL DEFAULT 'web',
+    website      TEXT,
+    country      TEXT,
+    contact_name TEXT,
+    contact_email TEXT,
+    contact_phone TEXT,
+    scale        TEXT,
+    rating       NUMERIC(3,2),
+    attributes   JSONB NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE report (

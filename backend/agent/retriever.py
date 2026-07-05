@@ -11,7 +11,8 @@ from web_research.researcher import WebResearcher
 
 
 class SupplierRetriever:
-    MIN_DISPLAY_SCORE = 60
+    MIN_DISPLAY_SCORE = 60  # ChromaDB mode
+    MIN_DISPLAY_SCORE_LEXICAL = 35  # Lexical-only mode (no embeddings)
 
     def __init__(self, chroma_collection, suppliers: list[dict], llm=None):
         self.collection = chroma_collection
@@ -36,47 +37,39 @@ class SupplierRetriever:
           6. Merge local + web results, cap at top_k (no padding to 10).
         """
         query_str = self._intent_to_query(intent)
-        # Important order: local database is searched first, then web research supplements it.
         all_local = self._search_local(query_str, intent, top_k=len(self.suppliers))
         qualified = self._displayable_results(all_local)
         if progress:
-            progress(
-                "retrieve",
-                f"本地数据库已检索完成：找到 {len(all_local)} 条本地候选，其中 {len(qualified)} 条达到 60% 展示阈值；现在继续联网补充最新供应商。",
-                30,
-            )
+            progress("retrieve", f"本地数据库已检索完成：找到 {len(all_local)} 条本地候选，其中 {len(qualified)} 条达到展示阈值。", 30)
 
-        # ALWAYS run web search to supplement local results with fresh/current data.
-        # Previously we short-circuited when >=10 local suppliers qualified, which
-        # caused equipment searches to skip web search entirely → fast but low match quality.
-        if progress:
-            progress("web", "正在进行网络搜索，补充本地数据库之外的新供应商来源...", 36)
-        web_results = self._displayable_results(await self._web_search(intent, progress=progress))
-
-        # <5 web results → LLM rephrase & re-search with alt queries
-        if len(web_results) < 5 and (query or intent.keywords):
-            alt_queries = await self._generate_alt_queries(
-                query or " ".join(intent.keywords)
-            )
-            for alt_q in alt_queries:
-                alt_intent = ProcurementIntent(
-                    category=intent.category,
-                    country=intent.country,
-                    certifications=intent.certifications,
-                    max_price=intent.max_price,
-                    max_delivery_days=intent.max_delivery_days,
-                    keywords=alt_q.split(),
-                )
-                more = self._displayable_results(await self._web_search(alt_intent, progress=progress))
-                web_results = self._merge_results(web_results, more)
+        web_results = []
+        if self.collection is not None:
+            if progress:
+                progress("web", "正在进行网络搜索...", 36)
+            web_results = self._displayable_results(await self._web_search(intent, progress=progress))
+            if len(web_results) < 5 and (query or intent.keywords):
+                alt_queries = await self._generate_alt_queries(query or " ".join(intent.keywords))
+                for alt_q in alt_queries:
+                    alt_intent = ProcurementIntent(
+                        category=intent.category, country=intent.country,
+                        certifications=intent.certifications,
+                        max_price=intent.max_price, max_delivery_days=intent.max_delivery_days,
+                        keywords=alt_q.split(),
+                    )
+                    more = self._displayable_results(await self._web_search(alt_intent, progress=progress))
+                    web_results = self._merge_results(web_results, more)
 
         merged = self._merge_results(qualified, web_results)
         return merged[:top_k]
 
-    @classmethod
-    def _displayable_results(cls, results: list[dict]) -> list[dict]:
-        """Only show candidates that meet the product's relevance threshold."""
-        return [item for item in results if int(item.get("matchScore", 0) or 0) >= cls.MIN_DISPLAY_SCORE]
+    def _displayable_results(self, results: list[dict]) -> list[dict]:
+        """Only show candidates above relevance threshold.
+        
+        Uses lower threshold (35) when ChromaDB embeddings are not available,
+        since lexical scoring naturally produces lower scores than semantic search.
+        """
+        threshold = self.MIN_DISPLAY_SCORE_LEXICAL if self.collection is None else self.MIN_DISPLAY_SCORE
+        return [item for item in results if int(item.get("matchScore", 0) or 0) >= threshold]
 
     async def _web_search(self, intent: ProcurementIntent, progress=None) -> list[dict]:
         """Run agent-like web research to discover external supplier candidates.
@@ -155,31 +148,16 @@ class SupplierRetriever:
         self._collection_built = False
 
     def _ensure_collection(self) -> None:
-        """Build ChromaDB collection lazily (avoids blocking init on model download).
+        """Always use lightweight lexical scoring — no embedding model download.
 
-        On Render's free tier, downloading sentence-transformers (BAAI/bge-m3, ~2 GB)
-        on every cold start causes 502 timeout / OOM.  Skip embedding-based populating
-        when the collection is empty and fall through to the lexical-scoring fallback
-        in _search_local.
+        The BAAI/bge-m3 embedding model (~2 GB) exceeds Render's free-tier
+        memory (512 MB) and would cause OOM.  We rely on the improved
+        multi-field lexical scorer instead, which is fast and memory-safe.
         """
         if self._collection_built:
             return
         self._collection_built = True
-
-        if self.collection is None or not self.suppliers:
-            self.collection = None
-            return
-
-        # If the collection already has documents we can query it directly.
-        try:
-            count = self.collection.count()
-            if count > 0:
-                return
-        except Exception:
-            pass
-
-        # No pre-existing documents — avoid downloading the embedding model.
-        # The lexical-scoring fallback in _search_local handles this case.
+        # Never populate ChromaDB — always use lexical fallback
         self.collection = None
 
     def _search_local(self, query: str, intent: ProcurementIntent, top_k: int) -> list[dict]:
@@ -195,9 +173,10 @@ class SupplierRetriever:
 
         all_scored = []
         for supplier in self.suppliers:
-            base_score = chroma_by_id.get(supplier["id"])
-            if base_score is None:
-                base_score = self._lexical_score(query, supplier)
+            chroma_score = chroma_by_id.get(supplier["id"])
+            lexical_score = self._lexical_score(query, supplier)
+            # 取两种打分方式的最大值，确保品类/关键词匹配不会被语义搜索淹没
+            base_score = max(chroma_score or 0, lexical_score)
             enriched = self._apply_intent_boosts(supplier, intent, base_score)
             all_scored.append(enriched)
 
@@ -246,11 +225,11 @@ class SupplierRetriever:
         score = int(base_score)
         quality_prior = int(supplier.get("matchScore", 70))
         if intent.category and supplier.get("category") == intent.category:
-            score += 8
+            score += 15  # 品类精确匹配，大幅加分
         elif intent.category:
             score -= 10
         if intent.country and intent.country != "Europe" and supplier.get("country") == intent.country:
-            score += 5
+            score += 8  # 国家匹配加分
         if intent.certifications:
             supplier_certs = {cert.upper() for cert in supplier.get("certifications", [])}
             if all(cert.upper() in supplier_certs for cert in intent.certifications):

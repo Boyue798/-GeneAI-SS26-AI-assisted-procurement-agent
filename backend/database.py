@@ -37,6 +37,8 @@ async def query_suppliers(
     这些字段如果不存在，先用默认值占位，等数据补全。
     """
     conn = get_connection()
+    if conn is None:
+        return []
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         query = """
@@ -103,6 +105,8 @@ async def query_products(
     返回符合前端 ComparisonItem 格式的数据。
     """
     conn = get_connection()
+    if conn is None:
+        return []
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         query = """

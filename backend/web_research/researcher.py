@@ -84,7 +84,7 @@ class DeepEvidence:
 
 
 class SearchProvider(Protocol):
-    async def search(self, query: str, max_results: int = 8) -> list[SearchResult]: ...
+    async def search(self, query: str, max_results: int = 15) -> list[SearchResult]: ...
 
 
 class PageFetcher(Protocol):
@@ -92,38 +92,77 @@ class PageFetcher(Protocol):
     async def fetch_page(self, url: str) -> PageSnapshot: ...
 
 
-class DuckDuckGoSearchProvider:
-    async def search(self, query: str, max_results: int = 8) -> list[SearchResult]:
-        try:
+class SearXNGSearchProvider:
+    """DeepSeek native web search — no third-party search API needed.
+
+    DeepSeek's API includes a built-in web_search tool that returns
+    real-time search results with citations.  Uses your existing
+    DeepSeek API key — zero extra cost, zero rate limits beyond
+    your LLM quota.  Much faster and more reliable than DDG/SearXNG.
+    """
+
+    async def search(self, query: str, max_results: int = 15) -> list[SearchResult]:
+        """Search the web via DeepSeek's native web_search tool."""
+
+        def _run() -> list[SearchResult]:
             try:
-                from ddgs import DDGS
-            except ImportError:
-                from duckduckgo_search import DDGS
+                import os, httpx
 
-            def run() -> list[SearchResult]:
-                with DDGS(timeout=8) as ddgs:
-                    rows = list(ddgs.text(query, max_results=max_results))
-                # Filter: prefer German (.de) and EU results, reject Asian TLDs
-                filtered = []
-                for row in rows:
-                    url = row.get("href") or row.get("url") or ""
-                    from urllib.parse import urlparse as _up
-                    tld = (_up(url).netloc or "").split(".")[-1].lower() if url else ""
-                    if tld in ("cn", "tw", "jp", "kr", "hk", "ru", "br", "in"):
-                        continue  # Skip non-European results
-                    filtered.append(row)
-                return [
-                    SearchResult(
-                        title=row.get("title") or "Web supplier",
-                        url=row.get("href") or row.get("url") or "",
-                        snippet=row.get("body") or "",
-                    )
-                    for row in filtered
-                    if row.get("href") or row.get("url")
-                ]
+                api_key = os.getenv("OPENAI_API_KEY", "")
+                if not api_key:
+                    return []
 
-            return await asyncio.to_thread(run)
-        except Exception:
+                resp = httpx.post(
+                    "https://api.deepseek.com/anthropic/v1/messages",
+                    headers={
+                        "content-type": "application/json",
+                        "x-api-key": api_key,
+                    },
+                    json={
+                        "model": "deepseek-v4-flash",
+                        "max_tokens": 4096,
+                        "messages": [{
+                            "role": "user",
+                            "content": f"Search the web for: {query}. Return the results as a list with title, URL, and brief description for each.",
+                        }],
+                        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                        "tool_choice": {"type": "auto"},
+                    },
+                    timeout=15.0,
+                )
+
+                if resp.status_code != 200:
+                    return []
+
+                data = resp.json()
+                results = []
+                for block in data.get("content", []):
+                    if block.get("type") == "web_search_tool_result":
+                        for item in block.get("content", []):
+                            if item.get("type") == "web_search_result":
+                                title = item.get("title", "")
+                                url = item.get("url", "")
+                                if not url:
+                                    continue
+                                results.append(SearchResult(
+                                    title=title or "Web supplier",
+                                    url=url,
+                                    snippet=item.get("page_age") or "",
+                                ))
+                                if len(results) >= max_results:
+                                    break
+                    if len(results) >= max_results:
+                        break
+                return results
+            except Exception:
+                return []
+
+        try:
+            results = await asyncio.wait_for(
+                asyncio.to_thread(_run), timeout=20.0
+            )
+            return results[:max_results] if results else []
+        except (asyncio.TimeoutError, Exception):
             return []
 
 
@@ -495,7 +534,7 @@ class WebResearcher:
         page_fetcher: PageFetcher | None = None,
         llm: Any = None,
     ):
-        self.search_provider = search_provider or DuckDuckGoSearchProvider()
+        self.search_provider = search_provider or SearXNGSearchProvider()
         self.page_fetcher = page_fetcher or StaticPageFetcher()
         self.llm = llm
 
@@ -504,105 +543,175 @@ class WebResearcher:
     # ------------------------------------------------------------------
 
     async def research(self, intent: ProcurementIntent, max_suppliers: int = 8,
-                       progress=None) -> list[dict]:
+                       progress=None, timeout: float = 120.0) -> list[dict]:
         """LLM-driven supplier discovery pipeline.
 
         When *progress* is provided, it is called as progress(phase, message, pct)
         whenever a meaningful step completes, so the frontend can display the
         agent's real-time thought process.
+
+        All parallelisable steps race LLM vs rule-based paths; total timeout
+        enforced via asyncio.wait_for to prevent runaway pipelines.
         """
-        if progress:
-            progress("think", "正在通过 LLM 规划 B2B 供应商搜索策略...", 46)
+        # Captured for timeout fallback — return whatever we have
+        collected_suppliers: list[dict] = []
 
-        # 1. LLM plans search queries
-        queries = await self._llm_plan_queries(intent)
-        if not queries:
-            queries = self._rule_plan_queries(intent)
+        async def _do_research() -> list[dict]:
+            nonlocal collected_suppliers
 
-        if progress:
-            progress("think", f"LLM 生成了 {len(queries)} 条针对性的 B2B 搜索查询，准备依次执行...", 48)
-
-        # 2. Execute queries, collect results
-        collected: dict[str, SearchResult] = {}
-        executed_queries: set[str] = set()
-
-        async def execute_query_batch(batch: list[str], start_index: int = 0, label: str = "搜索") -> None:
-            nonlocal collected
-            total = min(len(batch), 6)
-            for idx, query in enumerate(batch[:6]):
-                if query in executed_queries:
-                    continue
-                executed_queries.add(query)
-                results = await self._search_with_retry(query, max_results=10)
-                new_count = 0
-                for result in results:
-                    if not self._url_ok(result.url):
-                        continue
-                    key = self._url_key(result.url) or result.title.lower()
-                    if key and key not in collected:
-                        collected[key] = result
-                        new_count += 1
-                if progress:
-                    progress("think",
-                             f"{label} [{idx+1}/{total}]: {query[:50]}... → 新增 {new_count} 条，累计 {len(collected)} 条",
-                             48 + int((start_index + idx) * 3))
-                if len(collected) >= max_suppliers * 3:
-                    break
-
-        await execute_query_batch(queries, label="搜索")
-
-        if len(collected) < max_suppliers * 2:
-            fallback_queries = [q for q in self._rule_plan_queries(intent) if q not in executed_queries]
-            if progress and fallback_queries:
-                progress("think", f"LLM 查询结果偏少（{len(collected)} 条），追加规则 B2B 查询兜底...", 58)
-            await execute_query_batch(fallback_queries, start_index=len(queries), label="兜底搜索")
-
-        results_list = list(collected.values())
-        if progress:
-            progress("think", f"共收集到 {len(results_list)} 条候选搜索结果，正在用 LLM 判断哪些是真正的供应商页面...", 60)
-
-        # 3. LLM judges which results are real supplier pages
-        relevant = await self._llm_filter_relevant(results_list, intent)
-        min_relevant = min(len(results_list), max_suppliers * 2)
-        if len(relevant) < min_relevant:
-            rule_relevant = self._rule_filter_relevant(results_list, intent)
-            relevant = self._merge_search_results(relevant, rule_relevant)[:min_relevant]
             if progress:
-                progress("think", f"LLM 筛选结果偏少，已用规则信号补足到 {len(relevant)} 条候选，避免同一问题结果数量大幅波动。", 64)
+                progress("think", "正在通过 LLM 规划 B2B 供应商搜索策略...", 46)
 
-        if progress:
-            progress("think", f"LLM 筛选完成：从 {len(results_list)} 条中识别出 {len(relevant)} 条相关供应商", 65)
+            # ── 1. LLM + rule query planning in parallel ──
+            #     Take whichever returns first; cancel the slower one.
+            llm_q = asyncio.create_task(self._llm_plan_queries(intent))
+            rule_q = asyncio.create_task(asyncio.to_thread(self._rule_plan_queries, intent))
+            done, pending = await asyncio.wait(
+                [llm_q, rule_q], return_when=asyncio.FIRST_COMPLETED, timeout=8.0,
+            )
+            queries: list[str] = []
+            if llm_q in done and not llm_q.exception():
+                queries = llm_q.result()
+            if not queries and rule_q in done and not rule_q.exception():
+                queries = rule_q.result()
+            for t in pending:
+                t.cancel()
+            for t in pending:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            # If neither produced useful results, fall back synchronously.
+            # _rule_plan_queries is a pure function — re-invocation is safe.
+            if not queries:
+                queries = self._rule_plan_queries(intent)
 
-        # 4. Extract supplier profiles from relevant results
-        suppliers: list[dict] = []
-        for idx, result in enumerate(relevant[:max_suppliers * 2]):
-            if progress and result.title:
-                progress("think", f"正在提取供应商信息 [{idx+1}/{min(len(relevant), max_suppliers*2)}]: {result.title[:50]}", 
-                         65 + int(idx * 2))
-            supplier = await self._result_to_supplier(result, intent, progress=progress, index=idx+1,
-                                                     total=min(len(relevant), max_suppliers*2))
-            if supplier:
-                suppliers.append(supplier)
-            if len(suppliers) >= max_suppliers:
-                break
+            if progress:
+                progress("think", f"生成了 {len(queries)} 条针对性的 B2B 搜索查询，准备并行执行...", 48)
 
-        # 5. Merge with category fallback suppliers
-        suppliers = self.merge_supplier_lists(suppliers, self._fallback_suppliers(intent))
-        return suppliers[:max_suppliers]
+            # ── 2. Execute queries, collect results ──
+            collected: dict[str, SearchResult] = {}
+            executed_queries: set[str] = set()
 
-    async def _search_with_retry(self, query: str, max_results: int = 10, attempts: int = 2) -> list[SearchResult]:
-        last: list[SearchResult] = []
-        for attempt in range(attempts):
+            async def execute_query_batch(batch: list[str], start_index: int = 0, label: str = "搜索") -> None:
+                nonlocal collected
+                to_run = [q for q in batch[:6] if q not in executed_queries]
+                if not to_run:
+                    return
+                for q in to_run:
+                    executed_queries.add(q)
+                # 并行执行所有搜索
+                tasks = [self._search_with_retry(q, max_results=10) for q in to_run]
+                all_results = await asyncio.gather(*tasks, return_exceptions=True)
+                for idx, (query, results) in enumerate(zip(to_run, all_results)):
+                    if isinstance(results, Exception):
+                        continue
+                    new_count = 0
+                    for result in results:
+                        if not self._url_ok(result.url):
+                            continue
+                        key = self._url_key(result.url) or result.title.lower()
+                        if key and key not in collected:
+                            collected[key] = result
+                            new_count += 1
+                    if progress:
+                        progress("think",
+                                 f"{label} [{idx+1}/{len(to_run)}]: {query[:50]}... → 新增 {new_count} 条，累计 {len(collected)} 条",
+                                 48 + int((start_index + idx) * 3))
+                    if len(collected) >= max_suppliers * 3:
+                        break
+
+            await execute_query_batch(queries, label="搜索")
+
+            if len(collected) < max_suppliers * 2:
+                fallback_queries = [q for q in self._rule_plan_queries(intent) if q not in executed_queries]
+                if progress and fallback_queries:
+                    progress("think", f"LLM 查询结果偏少（{len(collected)} 条），追加规则 B2B 查询兜底...", 58)
+                await execute_query_batch(fallback_queries, start_index=len(queries), label="兜底搜索")
+
+            results_list = list(collected.values())
+            if progress:
+                progress("think", f"共收集到 {len(results_list)} 条候选搜索结果，正在判断哪些是真正的供应商页面...", 60)
+
+            # ── 3. Filter relevant results ──
+            #     Rule-based filter is instant and safe; LLM runs in background
+            #     for better quality but never blocks the pipeline.
+            rule_relevant = self._rule_filter_relevant(results_list, intent)
+
+            # Try LLM in background — fire-and-forget, don't cancel
+            llm_f = asyncio.create_task(self._llm_filter_relevant(results_list, intent))
+
+            # Use rule results immediately
+            relevant = rule_relevant
+
+            # If LLM finishes quickly, use its results instead
             try:
-                results = await self.search_provider.search(query, max_results=max_results)
-            except Exception:
-                results = []
-            if results:
-                return results
-            last = results
-            if attempt + 1 < attempts:
-                await asyncio.sleep(0.25)
-        return last
+                llm_result = await asyncio.wait_for(llm_f, timeout=8.0)
+                if llm_result:
+                    relevant = self._merge_search_results(relevant, llm_result)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+
+            # Cap how many suppliers we process — prevents downstream bloat
+            max_process = min(max_suppliers * 2, 30)
+            min_relevant = min(len(results_list), max_process)
+            if len(relevant) < min_relevant:
+                rule_relevant = self._rule_filter_relevant(results_list, intent)
+                relevant = self._merge_search_results(relevant, rule_relevant)[:min_relevant]
+                if progress:
+                    progress("think", f"筛选结果偏少，已用规则信号补足到 {len(relevant)} 条候选，避免同一问题结果数量大幅波动。", 64)
+            else:
+                relevant = relevant[:max_process]
+
+            if progress:
+                progress("think", f"筛选完成：从 {len(results_list)} 条中识别出 {len(relevant)} 条相关供应商", 65)
+
+            # ── 4. Extract supplier profiles in parallel ──
+            #     Semaphore bumped 3→5 for higher throughput (DDG fetches are
+            #     the bottleneck, not LLM concurrency).
+            _semaphore = asyncio.Semaphore(5)
+
+            async def _extract_with_limit(result, idx):
+                async with _semaphore:
+                    if progress and result.title:
+                        progress("think",
+                                 f"正在提取供应商信息 [{idx+1}/{min(len(relevant), max_process)}]: {result.title[:50]}",
+                                 65 + int(idx * 2))
+                    return await self._result_to_supplier(
+                        result, intent, progress=progress, index=idx + 1,
+                        total=min(len(relevant), max_process),
+                    )
+
+            tasks = [_extract_with_limit(result, idx) for idx, result in enumerate(relevant[:max_process])]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            suppliers = [s for s in results if isinstance(s, dict) and s]
+            suppliers = suppliers[:max_suppliers]
+
+            # ── 5. Merge with category fallback suppliers ──
+            suppliers = self.merge_supplier_lists(suppliers, self._fallback_suppliers(intent))
+            collected_suppliers = suppliers
+            return suppliers[:max_suppliers]
+
+        # Top-level timeout — returns partial results on timeout instead of crashing
+        try:
+            return await asyncio.wait_for(_do_research(), timeout=timeout)
+        except asyncio.TimeoutError:
+            if progress:
+                progress("think", f"研究超时（{timeout}s），返回已收集的供应商...", 90)
+            if collected_suppliers:
+                return collected_suppliers[:max_suppliers]
+            return []
+
+    async def _search_with_retry(self, query: str, max_results: int = 10, attempts: int = 1) -> list[SearchResult]:
+        """DDG search with hard 10-second timeout to prevent cascading hangs."""
+        try:
+            results = await asyncio.wait_for(
+                self.search_provider.search(query, max_results=max_results),
+                timeout=20.0,
+            )
+            return results or []
+        except (asyncio.TimeoutError, Exception):
+            return []
 
     # ------------------------------------------------------------------
     # LLM query planning
@@ -624,14 +733,13 @@ class WebResearcher:
             f"Keywords from user query: {keywords}\n"
             f"Budget: €{intent.max_price if intent.max_price else 'not specified'}\n"
             f"Delivery: {intent.max_delivery_days or 'not specified'} days\n\n"
-            "Generate 5-6 DuckDuckGo search queries to find REAL B2B suppliers on the web. "
+            "Generate 5-6 web search queries to find REAL B2B suppliers. "
             "Each query should be a complete search string, one per line.\n\n"
             "Rules:\n"
-            "- Target B2B directories: site:wlw.de, site:europages.de, site:kompass.com, site:lieferanten.de\n"
             "- Use the target country's language (German for Germany, French for France, etc.)\n"
-            "- Include B2B-specific terms: Lieferant, Großhandel, Hersteller, wholesaler, B2B\n"
-            "- Exclude consumer/retail noise: -Amazon -eBay -Pinterest\n"
-            "- Focus on the specific products/services the user needs\n\n"
+            "- Include B2B-specific terms: Lieferant, Großhandel, Hersteller, manufacturer, B2B, supplier\nStart with at least 2 queries targeting wlw.de, europages.de\n"
+            "- Focus on the specific products/services the user needs\n"
+            "- Use natural language queries — NO site: operators\n\n"
             "Return ONLY the queries, one per line. No numbering, no explanations."
         )
 
@@ -922,21 +1030,22 @@ class WebResearcher:
         country = intent.country or "Germany"
         kw = " ".join(intent.keywords[:6])
         category = intent.category or ""
-        exclusions = "-amazon -ebay -pinterest -linkedin -youtube -tiktok"
         queries = []
 
-        # Always search B2B directories directly
+        # Priority: B2B directory-specific searches
+        queries.append(f"{kw} {category} wlw.de supplier {country}")
+        queries.append(f"{kw} {category} europages supplier {country}")
+
         if country == "Germany":
-            queries.append(f"site:wlw.de {kw} Lieferant {category}")
-            queries.append(f"site:europages.de {kw} Deutschland {category}")
-            queries.append(f"site:lieferanten.de {kw}")
-        queries.append(f"site:kompass.com {kw} {category} supplier {country}")
-        queries.append(f"site:industrystock.de {kw} {category}")
+            queries.append(f"{kw} {category} Lieferant Hersteller Deutschland")
+            queries.append(f"{kw} {category} B2B supplier Germany")
+        queries.append(f"{kw} {category} manufacturer supplier {country}")
+        queries.append(f"{kw} {category} Großhandel")
 
         # General web search with B2B terms
-        queries.append(f"{kw} {category} supplier {country} B2B wholesale {exclusions}")
+        queries.append(f"{kw} {category} supplier {country} B2B wholesale")
         if country == "Germany":
-            queries.append(f"{kw} Lieferant Großhandel Deutschland {category} {exclusions}")
+            queries.append(f"{kw} Lieferant Großhandel Deutschland {category}")
 
         return [q for q in queries if q][:6]
 

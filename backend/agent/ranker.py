@@ -232,7 +232,7 @@ class LLMRanker:
         """
         score = int(candidate.get("matchScore", 0))
         if candidate.get("source") == "database" or candidate.get("repurchasePriority") == "database":
-            score += 3
+            score += 8  # 数据库供应商复用加分，确保在轻量模式下不被网络结果淹没
         return max(0, min(100, score))
 
     @staticmethod

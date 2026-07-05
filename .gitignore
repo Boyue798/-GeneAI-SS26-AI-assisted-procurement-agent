@@ -37,3 +37,4 @@ backend/chroma_data/
 
 # Local user conversation data (never commit)
 backend/data/conversations/
+backend/.venv/

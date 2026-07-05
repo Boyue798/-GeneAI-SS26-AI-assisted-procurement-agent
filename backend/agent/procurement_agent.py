@@ -9,7 +9,7 @@ from typing import Optional
 from agent.parser import IntentParser
 from agent.ranker import LLMRanker
 from agent.retriever import SupplierRetriever
-from web_research.researcher import DuckDuckGoSearchProvider, SearchResult, StaticPageFetcher, WebResearcher
+from web_research.researcher import SearXNGSearchProvider, SearchResult, StaticPageFetcher, WebResearcher
 from web_research.idealo_scraper import search_idealo
 from web_research.wlw_scraper import search_wlw
 from database import query_suppliers_sync, query_products_sync
@@ -64,7 +64,7 @@ class ProcurementAgent:
         chroma_collection = self._create_chroma_collection()
         self.retriever = SupplierRetriever(chroma_collection, self.suppliers, llm=self.llm)
         self.ranker = LLMRanker(self.llm)
-        self.quote_search_provider = DuckDuckGoSearchProvider()
+        self.quote_search_provider = SearXNGSearchProvider()
         self.quote_page_fetcher = StaticPageFetcher()
         self.web_researcher = WebResearcher(
             search_provider=self.quote_search_provider,
@@ -133,50 +133,35 @@ class ProcurementAgent:
                 if progress:
                     progress("parse", f"已翻译为德语搜索词：「{german_supplier_phrase}」。", 26)
 
-        # ── Phase 1: Local database (Chroma) ──────────────────────────
+        # ── Phase 1: Local + Web search in PARALLEL ──────────────────
         if progress:
-            progress("retrieve", "第一步：检索本地供应商数据库，确认是否已有可复购/可复用供应商...", 30)
+            progress("retrieve", "同时启动本地数据库和网络搜索，并行执行以最大程度缩短等待时间...", 30)
 
-        local_candidates = await self.retriever.search(intent, query=query, progress=progress)
+        async def _run_local():
+            return await self.retriever.search(intent, query=query, progress=progress)
 
-        if progress:
-            progress("retrieve", f"本地数据库：找到 {len(local_candidates)} 个候选供应商。", 44)
-
-        # ── Phase 2: WLW.de B2B directory (direct scrape) ─────────────
-        web_candidates: list[dict] = []
-        wlw_phrase = german_supplier_phrase or self._supplier_search_phrase(query, intent)
-
-        if progress:
-            progress("web", f"第二步：搜索 WLW.de B2B 供应商目录：「{wlw_phrase}」...", 44)
-
-        try:
-            wlw_results = await search_wlw(wlw_phrase, limit=5, timeout=50)
-            if progress:
-                progress("web", f"WLW.de 返回 {len(wlw_results)} 家供应商。", 50)
-            web_candidates = await self._normalize_web_suppliers(wlw_results, intent)
-        except Exception as e:
-            if progress:
-                progress("web", f"WLW.de 搜索失败（{e}），将使用搜索引擎兜底...", 50)
-            wlw_results = []
-
-        # ── Phase 3: WebResearcher (DDG + LLM) fallback ────────────────
-        if len(wlw_results) < 3:
-            if progress:
-                progress("web", f"WLW 仅返回 {len(wlw_results)} 家，启动 WebResearcher（DDG搜索+LLM识别）补充...", 52)
-
+        async def _run_web():
+            # DeepSeek web search — WLW.de results come through
+            # site:wlw.de and site:europages.de queries in researcher.
             try:
-                researcher_results = await self.web_researcher.research(
-                    intent, max_suppliers=5, progress=progress
-                )
-                if progress:
-                    progress("web", f"WebResearcher 补充了 {len(researcher_results)} 家候选供应商。", 62)
-                web_candidates = self._merge_supplier_candidates(
-                    web_candidates,
-                    await self._normalize_web_suppliers(researcher_results, intent),
+                return await self._normalize_web_suppliers(
+                    await self.web_researcher.research(intent, max_suppliers=10, progress=progress),
+                    intent,
                 )
             except Exception as e:
                 if progress:
-                    progress("web", f"WebResearcher 失败（{e}），仅使用 WLW + 本地数据库结果。", 62)
+                    progress("web", f"WebResearcher 失败: {e}", 52)
+                return []
+
+        # Execute local + web in parallel
+        local_task = asyncio.create_task(_run_local())
+        web_task = asyncio.create_task(_run_web())
+
+        local_candidates = await local_task
+        web_candidates = await web_task
+
+        if progress:
+            progress("retrieve", f"本地数据库：找到 {len(local_candidates)} 家候选供应商。", 44)
 
         # ── Phase 4: Merge all sources ─────────────────────────────────
         all_candidates = self._merge_supplier_candidates(local_candidates, web_candidates)
@@ -193,7 +178,7 @@ class ProcurementAgent:
         ranked = [
             supplier
             for supplier in await self.ranker.rank_suppliers(query, all_candidates)
-            if int(supplier.get("matchScore", 0) or 0) >= 60
+            if int(supplier.get("matchScore", 0) or 0) >= 50  # 轻量模式兼容：词法匹配产生较低分数
         ]
 
         top = ranked[0]["name"] if ranked else "未找到匹配供应商"
@@ -352,11 +337,21 @@ class ProcurementAgent:
         if progress:
             progress("retrieve", "第一步先检索本地标准品/报价数据库，确认是否已有可比价商品...", 28)
 
+        # 本地候选：优先按 category 精确匹配，匹配不到则不过滤
         local_candidates = [
             {**quote, "source": quote.get("source", "database"), "sourceDetail": quote.get("sourceDetail", "database")}
             for quote in self.quotes
-            if intent.category is None or quote.get("category") == intent.category
+            if intent.category is None
+            or not quote.get("category")
+            or quote.get("category") == intent.category
         ]
+        # 如果 category 精确匹配返回 0（如 DB 里是 "office" 但 parser 提取了 "paper"），
+        # 回退到不过滤 category，靠后续关键词和 _is_relevant_quote_item 来做相关性判断
+        if not local_candidates:
+            local_candidates = [
+                {**quote, "source": quote.get("source", "database"), "sourceDetail": quote.get("sourceDetail", "database")}
+                for quote in self.quotes
+            ]
         # When category is unknown, pre-filter by keyword to avoid flooding
         # the pipeline with 200+ irrelevant items (e.g., A4 paper when user
         # searches for "人体工学椅"). The full _is_relevant_quote_item check
@@ -399,7 +394,7 @@ class ProcurementAgent:
         if progress:
             progress("web", f"正在 idealo.de 搜索：「{search_phrase}」...", 52)
         try:
-            idealo_candidates = await search_idealo(search_phrase, limit=4, timeout=35)
+            idealo_candidates = await search_idealo(search_phrase, limit=4, timeout=3)
         except Exception:
             idealo_candidates = []
         if progress and idealo_candidates:
@@ -557,11 +552,11 @@ class ProcurementAgent:
         industrial_signals = ("festo", "steckanschluss", "anschluss", "pneumatik", "qs", "verschraubung")
         if any(signal in lower_phrase for signal in industrial_signals):
             queries = [
-                f"site:festo.com/de/de {product_phrase}",
-                f"site:automation24.de {product_phrase}",
-                f"site:de.rs-online.com {product_phrase}",
-                f"site:conrad.de {product_phrase}",
-                f"site:voelkner.de {product_phrase}",
+                f"{product_phrase} festo.com kaufen",
+                f"{product_phrase} automation24.de Preis",
+                f"{product_phrase} rs-online.com bestellen",
+                f"{product_phrase} conrad.de kaufen",
+                f"{product_phrase} voelkner.de Preis",
                 f"{product_phrase} kaufen Preis EUR",
             ]
         elif is_non_office:
@@ -569,20 +564,21 @@ class ProcurementAgent:
             queries = [
                 f"{product_phrase} kaufen Preis EUR",
                 f"{product_phrase} online shop Deutschland",
-                f"site:idealo.de {product_phrase}",
-                f"site:notebooksbilliger.de {product_phrase}",
-                f"site:cyberport.de {product_phrase}",
-                f"site:alternate.de {product_phrase}",
-                f"site:mediamarkt.de {product_phrase}",
-                f"site:saturn.de {product_phrase}",
-                f"site:amazon.de {product_phrase}",
+                f"{product_phrase} idealo.de Preis",
+                f"{product_phrase} notebooksbilliger.de kaufen",
+                f"{product_phrase} cyberport.de Preis",
+                f"{product_phrase} alternate.de bestellen",
+                f"{product_phrase} mediamarkt.de Preis",
+                f"{product_phrase} saturn.de kaufen",
+                f"{product_phrase} amazon.de Preis EUR",
             ]
         else:
             queries = [
-                f"site:bueromarkt-ag.de {product_phrase}",
-                f"site:schaefer-shop.de {product_phrase}",
-                f"site:viking.de {product_phrase}",
-                f"site:amazon.de {product_phrase}",
+                f"{product_phrase} idealo.de Preis",
+                f"{product_phrase} bueromarkt-ag.de kaufen",
+                f"{product_phrase} schaefer-shop.de Preis",
+                f"{product_phrase} viking.de bestellen",
+                f"{product_phrase} amazon.de Preis EUR",
                 f"{product_phrase} kaufen Preis EUR",
                 f"{product_phrase} günstig bestellen",
             ]
@@ -681,6 +677,30 @@ class ProcurementAgent:
                     progress("web", f"商品页未返回可读正文，可能被验证码/反爬拦截：{host}。", 67)
             except Exception:
                 evidence_text = ""
+        # ── DeepSeek price lookup: ask API directly for product price ──
+        if price is None and evidence_text and os.getenv("OPENAI_API_KEY"):
+            try:
+                import httpx
+                dk_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/anthropic/v1/messages")
+                headers = {
+                    "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "model": os.getenv("LLM_MODEL", "deepseek-v4-flash"),
+                    "messages": [
+                        {"role": "user", "content": f"Product: {title}.\\nPage text: {evidence_text[:2000]}.\\n\\nWhat is the unit price in EUR? Reply ONLY with the number, e.g. 12.99"}
+                    ],
+                    "temperature": 0,
+                }
+                resp = httpx.post(dk_url, json=payload, headers=headers, timeout=15.0)
+                if resp.status_code == 200:
+                    raw = resp.json()["choices"][0]["message"]["content"].strip()
+                    price = self._extract_eur_price(raw)
+                    if price and progress:
+                        progress("web", f"DeepSeek 提取到价格：{title[:30]} → €{price:.2f}", 67)
+            except Exception:
+                pass
         if not self._is_relevant_quote_result(f"{text} {evidence_text}", query, intent, price_found=price is not None):
             return None
         # Sanity check: office supplies rarely exceed 200 EUR per unit
@@ -1234,7 +1254,7 @@ class ProcurementAgent:
     @staticmethod
     def _create_llm():
         api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key or api_key == "sk-your-key-here":
+        if not api_key:
             return None
         try:
             from langchain_openai import ChatOpenAI

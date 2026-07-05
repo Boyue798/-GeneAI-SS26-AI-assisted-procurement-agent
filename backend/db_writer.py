@@ -29,6 +29,9 @@ def save_sourcing_request_and_suppliers(
          - 如果是新发现的（数据库里没有）→ 插入 sourcing_candidate（不是 supplier！）
     """
     conn = get_connection()
+    if conn is None:
+        print("[db_writer] 无数据库连接，跳过保存 sourcing 结果")
+        return
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -110,6 +113,9 @@ def promote_candidate_to_supplier(candidate_name: str) -> bool:
     返回 True 表示成功转正，False 表示没找到这个候选人。
     """
     conn = get_connection()
+    if conn is None:
+        print("[db_writer] 无数据库连接，跳过保存 sourcing 结果")
+        return
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -174,6 +180,9 @@ def save_comparison_request_and_products(
         直接关联 product，业务含义和"寻源候选"不同。
     """
     conn = get_connection()
+    if conn is None:
+        print("[db_writer] 无数据库连接，跳过保存 sourcing 结果")
+        return
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -250,195 +259,5 @@ def save_comparison_request_and_products(
     except Exception as e:
         conn.rollback()
         print(f"[db_writer] 保存 comparison 结果失败: {e}")
-    finally:
-        conn.close()
-
-
-# ═══════════════════════════════════════════════════════
-# Comparison 相关功能
-# ═══════════════════════════════════════════════════════
-
-def save_comparison_request_and_quotes(
-    request_text: str,
-    requested_by: str,
-    items: list[dict],
-) -> None:
-    """
-    保存一次 Comparison 搜索：
-      1. 插入 procurement_request
-      2. 遍历 items，把每条报价存进 quote 表
-         - 先确保 supplier 存在（按 name 去重）
-         - 先确保 product 存在（按 name_de 去重）
-         - 再插入 quote
-    """
-    conn = get_connection()
-    if conn is None:
-        print("[db_writer] 无数据库连接，跳过保存")
-        return
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-
-        # 1. 插入请求记录
-        cur.execute(
-            """
-            INSERT INTO procurement_request (request_text, requested_by, status)
-            VALUES (%s, %s, %s)
-            RETURNING id
-            """,
-            (request_text, requested_by, "closed"),
-        )
-        conn.commit()
-
-        # 2. 遍历报价
-        for item in items:
-            vendor_name = item.get("vendor")
-            product_name = item.get("product")
-
-            if not vendor_name or not product_name:
-                continue
-
-            # ---- 确保 supplier 存在 ----
-            cur.execute("SELECT id FROM supplier WHERE name = %s", (vendor_name,))
-            existing_supplier = cur.fetchone()
-            if existing_supplier:
-                supplier_id = existing_supplier["id"]
-            else:
-                cur.execute(
-                    """
-                    INSERT INTO supplier (name, origin, rating, attributes)
-                    VALUES (%s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        vendor_name,
-                        "web",
-                        item.get("rating", 0) or 0,
-                        json.dumps({"platform": item.get("platform", "")}, ensure_ascii=False),
-                    ),
-                )
-                supplier_id = cur.fetchone()["id"]
-                conn.commit()
-
-            # ---- 确保 product 存在 ----
-            cur.execute("SELECT id FROM product WHERE name_de = %s", (product_name,))
-            existing_product = cur.fetchone()
-            if existing_product:
-                product_id = existing_product["id"]
-            else:
-                cur.execute(
-                    """
-                    INSERT INTO product (name_de, kind, reference_price, currency, preferred_supplier, attributes)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        product_name,
-                        "standard",
-                        item.get("unitPriceEur"),
-                        "EUR",
-                        supplier_id,
-                        json.dumps({
-                            "platform": item.get("platform"),
-                            "paymentTerm": item.get("paymentTerm"),
-                            "deliveryMethod": item.get("deliveryMethod"),
-                        }, ensure_ascii=False),
-                    ),
-                )
-                product_id = cur.fetchone()["id"]
-                conn.commit()
-
-            # ---- 插入 quote ----
-            # 用 source_url 去重，避免同一条报价重复插入
-            source_url = (item.get("sourceUrls") or [""])[0] or item.get("source_url", "")
-            if source_url:
-                cur.execute("SELECT id FROM quote WHERE source_url = %s", (source_url,))
-                if cur.fetchone():
-                    continue  # 已存在，跳过
-
-            attributes = {
-                "paymentTerm": item.get("paymentTerm"),
-                "paymentLabel": item.get("paymentLabel"),
-                "deliveryMethod": item.get("deliveryMethod"),
-                "reviews": item.get("reviews"),
-                "platform": item.get("platform"),
-            }
-
-            cur.execute(
-                """
-                INSERT INTO quote
-                    (product_id, supplier_id, listing_title, price, currency,
-                     lead_time_text, lead_time_days, in_stock, source_url,
-                     score, is_selected, attributes)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    product_id,
-                    supplier_id,
-                    product_name,
-                    item.get("unitPriceEur"),
-                    "EUR",
-                    item.get("deliveryLabel"),
-                    item.get("deliveryDays"),
-                    True,
-                    source_url or None,
-                    (item.get("matchScore", 0) or 0) / 20,  # 0-100 转成 0-5
-                    False,  # 默认未选中
-                    json.dumps(attributes, ensure_ascii=False),
-                ),
-            )
-        conn.commit()
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        print(f"[db_writer] 保存 comparison 结果失败: {e}")
-    finally:
-        conn.close()
-
-
-def select_best_quote(source_url: str, vendor_name: str) -> bool:
-    """
-    用户选择了最佳报价后调用：
-      1. 把这条 quote 的 is_selected 改成 TRUE
-      2. 把对应供应商写入 supplier 表（如果还没有）
-      v_product_best_quote 视图会自动更新，不需要手动操作
-    """
-    conn = get_connection()
-    if conn is None:
-        print("[db_writer] 无数据库连接，跳过操作")
-        return False
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-
-        # 1. 把这条 quote 标记为已选中
-        cur.execute(
-            "UPDATE quote SET is_selected = TRUE WHERE source_url = %s RETURNING id, supplier_id",
-            (source_url,),
-        )
-        row = cur.fetchone()
-        if not row:
-            print(f"[db_writer] 找不到这条 quote: {source_url}")
-            return False
-
-        conn.commit()
-
-        # 2. 确保供应商在 supplier 表里
-        supplier_id = row["supplier_id"]
-        if supplier_id:
-            cur.execute("SELECT id, origin FROM supplier WHERE id = %s", (supplier_id,))
-            existing = cur.fetchone()
-            if existing and existing["origin"] == "web":
-                # 用户选中了，说明这个供应商已经被认可，可以标记为 internal
-                cur.execute(
-                    "UPDATE supplier SET origin = 'internal' WHERE id = %s",
-                    (supplier_id,),
-                )
-                conn.commit()
-
-        return True
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        print(f"[db_writer] 选择最佳报价失败: {e}")
-        return False
     finally:
         conn.close()
