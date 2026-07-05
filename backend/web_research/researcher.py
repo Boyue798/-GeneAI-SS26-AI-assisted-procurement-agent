@@ -702,16 +702,26 @@ class WebResearcher:
                 return collected_suppliers[:max_suppliers]
             return []
 
-    async def _search_with_retry(self, query: str, max_results: int = 10, attempts: int = 1) -> list[SearchResult]:
-        """DDG search with hard 10-second timeout to prevent cascading hangs."""
-        try:
-            results = await asyncio.wait_for(
-                self.search_provider.search(query, max_results=max_results),
-                timeout=20.0,
-            )
-            return results or []
-        except (asyncio.TimeoutError, Exception):
-            return []
+    async def _search_with_retry(self, query: str, max_results: int = 10, attempts: int = 2) -> list[SearchResult]:
+        """Search with one empty-result retry to reduce provider flapping.
+
+        DeepSeek web search usually needs ~10-12s, so keep the per-attempt
+        timeout at 20s. Retrying only empty/failed attempts improves stability
+        without adding a global cutoff that would discard network search.
+        """
+        for attempt in range(max(1, attempts)):
+            try:
+                results = await asyncio.wait_for(
+                    self.search_provider.search(query, max_results=max_results),
+                    timeout=20.0,
+                )
+                if results:
+                    return results
+            except (asyncio.TimeoutError, Exception):
+                pass
+            if attempt < attempts - 1:
+                await asyncio.sleep(0.4)
+        return []
 
     # ------------------------------------------------------------------
     # LLM query planning
@@ -755,6 +765,7 @@ class WebResearcher:
             queries = []
             for line in content.strip().split("\n"):
                 q = line.strip().lstrip("0123456789.-) ").strip()
+                q = self._sanitize_search_query(q)
                 if q and len(q) > 10:
                     queries.append(q)
             return queries[:6]
@@ -1025,6 +1036,18 @@ class WebResearcher:
     # ------------------------------------------------------------------
     # Rule-based query planning (fallback)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sanitize_search_query(query: str) -> str:
+        """Convert Google-only operators into DeepSeek-friendly natural language.
+
+        DeepSeek web_search does not understand site: or negative operators. Keep
+        the domain/product intent as plain words instead of sending unsupported syntax.
+        """
+        q = re.sub(r"\bsite:([^\s]+)", r"\1", query or "", flags=re.I)
+        q = re.sub(r"(?<!\w)-(?=[A-Za-z])", " ", q)
+        q = re.sub(r"[\"']", " ", q)
+        return re.sub(r"\s+", " ", q).strip()
 
     def _rule_plan_queries(self, intent: ProcurementIntent) -> list[str]:
         country = intent.country or "Germany"

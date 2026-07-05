@@ -207,6 +207,7 @@ export function SourcingModule({
   )
   const [searchJob, setSearchJob] = useState<SourcingJob | null>(null)
   const [searchError, setSearchError] = useState(false)
+  const [errorDetail, setErrorDetail] = useState<string | null>(null)
   const [feedbackFor, setFeedbackFor] = useState<string | null>(null)
   const [activeConversationId, setActiveConversationId] = useState<string | null>(
     restore?.id ?? null
@@ -305,6 +306,7 @@ export function SourcingModule({
     setSearchStatus('running')
     setSearchJob(null)
     setSearchError(false)
+    setErrorDetail(null)
     setResults([])
     setCurrentStep(1)
 
@@ -332,12 +334,13 @@ export function SourcingModule({
           console.log(`[SourcingModule] Job finished:`, { status: finished.status, results: finished.results?.length })
           list = finished.results ?? []
           if (finished.status === 'failed') {
-            setResults(list)
             setSearchError(true)
+            setErrorDetail(finished.error ?? null)
             setSearchStatus('error')
           } else {
             setResults(list)
             setSearchStatus(list.length > 0 ? 'success' : 'empty')
+            setCurrentStep(3)
           }
         } catch {
           // Backend has no job endpoints yet (older deploy → 404). Fall back to the
@@ -347,6 +350,7 @@ export function SourcingModule({
           list = res.results ?? []
           setResults(list)
           setSearchStatus(list.length > 0 ? 'success' : 'empty')
+          setCurrentStep(3)
         }
       } else {
         // Keep the step animation visible in mock mode.
@@ -354,6 +358,7 @@ export function SourcingModule({
         list = MOCK_SUPPLIERS
         setResults(list)
         setSearchStatus('success')
+        setCurrentStep(3)
       }
       setHasRun(true)
       console.log(`[SourcingModule] Results set, saving to memory...`, { resultCount: list.length })
@@ -369,12 +374,12 @@ export function SourcingModule({
       console.log(`[SourcingModule] handleAnalyze SUCCESS, hasRun=true`)
     } catch (e) {
       console.error(`[SourcingModule] handleAnalyze CATCH:`, e)
+      setErrorDetail(e instanceof Error ? e.message : String(e))
       setSearchError(true)
       setSearchStatus('error')
       setHasRun(true)
     } finally {
       setIsAnalyzing(false)
-      setCurrentStep(3)
     }
   }
 
@@ -503,9 +508,11 @@ export function SourcingModule({
               <h2 className="text-base font-semibold text-slate-900">
                 {t.common.resultsFound(results.length)}
               </h2>
-              <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-medium text-emerald-700 ring-1 ring-emerald-600/20 print:hidden">
-                {t.common.analysisComplete}
-              </span>
+              {!searchError && (
+                <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-medium text-emerald-700 ring-1 ring-emerald-600/20 print:hidden">
+                  {t.common.analysisComplete}
+                </span>
+              )}
             </div>
             <ExportPrintToolbar
               t={t}
@@ -554,6 +561,7 @@ export function SourcingModule({
             <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-red-200 bg-red-50 p-12 text-red-500">
               <SearchIcon className="mb-3 h-7 w-7" />
               <p className="text-sm">{t.common.searchError}</p>
+              {errorDetail && <p className="mt-2 max-w-2xl text-center text-xs text-red-600">{errorDetail}</p>}
             </div>
           ) : results.length === 0 ? (
             <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white p-12 text-slate-400">
