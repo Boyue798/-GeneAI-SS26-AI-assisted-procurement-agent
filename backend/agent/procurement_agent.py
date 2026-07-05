@@ -681,7 +681,7 @@ class ProcurementAgent:
         if price is None and evidence_text and os.getenv("OPENAI_API_KEY"):
             try:
                 import httpx
-                dk_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/anthropic/v1/messages")
+                dk_url = self._deepseek_chat_completions_url()
                 headers = {
                     "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
                     "Content-Type": "application/json",
@@ -731,6 +731,20 @@ class ProcurementAgent:
             "evidenceSnippets": self._quote_evidence_snippets(evidence_text or snippet),
             "priceConfidence": "extracted" if price is not None else "unknown",
         }
+
+    @staticmethod
+    def _deepseek_chat_completions_url() -> str:
+        """Build OpenAI-compatible chat completions URL from OPENAI_BASE_URL.
+
+        The Desktop launcher sets OPENAI_BASE_URL=https://api.deepseek.com.
+        Posting to that root returns 404; price lookup must call /chat/completions.
+        """
+        base = (os.getenv("OPENAI_BASE_URL") or "https://api.deepseek.com").rstrip("/")
+        if base.endswith("/chat/completions"):
+            return base
+        if base.endswith("/v1"):
+            return f"{base}/chat/completions"
+        return f"{base}/chat/completions"
 
     @classmethod
     def _quote_price_search_queries(cls, query: str, intent) -> list[str]:

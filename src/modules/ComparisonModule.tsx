@@ -138,6 +138,7 @@ export function ComparisonModule({
   )
   const [comparisonJob, setComparisonJob] = useState<ComparisonJob | null>(null)
   const [searchError, setSearchError] = useState(false)
+  const [errorDetail, setErrorDetail] = useState<string | null>(null)
   const [feedbackFor, setFeedbackFor] = useState<string | null>(null)
   // Reopening a past conversation re-links feedback to that same record.
   const [activeConversationId, setActiveConversationId] = useState<string | null>(restore?.id ?? null)
@@ -219,6 +220,7 @@ export function ComparisonModule({
     setSearchStatus('running')
     setComparisonJob(null)
     setSearchError(false)
+    setErrorDetail(null)
 
     const filters = {
       minPrice: minPrice ? Number(minPrice) : undefined,
@@ -245,20 +247,24 @@ export function ComparisonModule({
           list = finished.results ?? []
           if (finished.status === 'failed') {
             setSearchError(true)
+            setErrorDetail(finished.error ?? null)
             setSearchStatus('error')
           } else {
             setSearchStatus(list.length > 0 ? 'success' : 'empty')
+            setCurrentStep(3)
           }
         } catch {
           setComparisonJob(null)
           const res = await api.comparison.search(enhancedRequirement, filters)
           list = res.results
           setSearchStatus(list.length > 0 ? 'success' : 'empty')
+          setCurrentStep(3)
         }
         setItems(list)
       } else {
         await new Promise((r) => setTimeout(r, 1800))
         setSearchStatus('success')
+        setCurrentStep(3)
       }
 
       const ranked = rankItems(list, { minPrice, maxPrice, deliveryTime, weights })
@@ -271,11 +277,11 @@ export function ComparisonModule({
       console.error('[ComparisonModule] handleAnalyze failed', e)
       list = []
       setItems(list)
+      setErrorDetail(e instanceof Error ? e.message : String(e))
       setSearchError(true)
       setSearchStatus('error')
     } finally {
       setIsAnalyzing(false)
-      setCurrentStep(3)
     }
   }
 
@@ -444,8 +450,9 @@ export function ComparisonModule({
         )}
 
         {searchError ? (
-          <div className="flex items-center justify-center rounded-lg border border-dashed border-red-200 bg-red-50 py-12 text-sm text-red-500">
-            {t.common.searchError}
+          <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-red-200 bg-red-50 px-6 py-12 text-sm text-red-500">
+            <p>{t.common.searchError}</p>
+            {errorDetail && <p className="mt-2 max-w-2xl text-center text-xs text-red-600">{errorDetail}</p>}
           </div>
         ) : (
           <ComparisonTable rows={rows} recommendedId={recommendedId} t={t} onSelect={(name) => setFeedbackFor(name)} />

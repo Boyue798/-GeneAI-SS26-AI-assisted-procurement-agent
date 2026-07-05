@@ -95,9 +95,9 @@ class StubLLM:
         self.calls.append(prompt)
         if "Generate" in prompt and "search queries" in prompt.lower() or "DuckDuckGo" in prompt:
             return _FakeResponse("\n".join([
-                "site:wlw.de Bürobedarf A4 Papier Ordner Lieferant Deutschland",
-                "site:europages.de A4 Papier Ordner Deutschland Bürobedarf",
-                "site:lieferanten.de A4 Papier Ordner Bürobedarf",
+                "wlw.de Bürobedarf A4 Papier Ordner Lieferant Deutschland",
+                "europages.de A4 Papier Ordner Deutschland Bürobedarf",
+                "lieferanten.de A4 Papier Ordner Bürobedarf",
                 "A4 Papier Ordner Lieferant Deutschland B2B Großhandel -Amazon -eBay -Pinterest",
                 "office supplies wholesaler Germany A4 paper folders B2B -amazon -ebay",
             ]))
@@ -144,24 +144,23 @@ class WebResearcherTest(unittest.TestCase):
         joined = "\n".join(queries).lower()
 
         self.assertGreaterEqual(len(queries), 5)
-        self.assertIn("site:wlw.de", joined)
-        self.assertIn("site:europages", joined)
-        self.assertIn("-amazon", joined)
-        self.assertIn("-ebay", joined)
+        self.assertIn("wlw.de", joined)
+        self.assertIn("europages", joined)
+        self.assertNotIn("site:", joined)
         self.assertNotIn("automotive supplier", joined)
 
     def test_research_with_llm_driven_pipeline_yields_real_suppliers(self):
         intent = ProcurementIntent(category="office", country="Germany", keywords=["A4", "Papier", "Ordner"])
         provider = FakeSearchProvider({
-            "site:wlw.de Bürobedarf A4 Papier Ordner Lieferant Deutschland": [
+            "wlw.de Bürobedarf A4 Papier Ordner Lieferant Deutschland": [
                 SearchResult(title="Office 365 login", url="https://www.office.com/", snippet="Microsoft login"),
                 SearchResult(title="Viking Office Deutschland Bürobedarf", url="https://www.viking.de/", snippet="A4 Papier Ordner supplier"),
                 SearchResult(title="OTTO Office Bürobedarf", url="https://www.otto-office.com/de/", snippet="Kopierpapier Büromaterial"),
             ],
-            "site:europages.de A4 Papier Ordner Deutschland Bürobedarf": [
+            "europages.de A4 Papier Ordner Deutschland Bürobedarf": [
                 SearchResult(title="Viking Office Deutschland Bürobedarf", url="https://www.viking.de/", snippet="A4 Papier Ordner supplier"),
             ],
-            "site:lieferanten.de A4 Papier Ordner Bürobedarf": [],
+            "lieferanten.de A4 Papier Ordner Bürobedarf": [],
             "A4 Papier Ordner Lieferant Deutschland B2B Großhandel -Amazon -eBay -Pinterest": [
                 SearchResult(title="Viking Office Deutschland Bürobedarf", url="https://www.viking.de/", snippet="A4 Papier Ordner supplier"),
             ],
@@ -215,10 +214,10 @@ class WebResearcherTest(unittest.TestCase):
     def test_rule_fallback_without_llm_still_works(self):
         intent = ProcurementIntent(category="office", country="Germany", keywords=["Bürobedarf"])
         provider = FakeSearchProvider({
-            "site:wlw.de Bürobedarf Lieferant office": [
+            "wlw.de Bürobedarf Lieferant office": [
                 SearchResult("Bürobedarf Müller GmbH - Lieferant", "https://www.europages.de/BUEROBEDARF-MUELLER/000000.html", "Bürobedarf Lieferant Deutschland"),
             ],
-            "site:europages.de Bürobedarf Deutschland office": [
+            "europages.de Bürobedarf Deutschland office": [
                 SearchResult("Papier Großhandel Schmidt KG", "https://www.europages.de/papier/", "Großhandel Papier Deutschland"),
             ],
         })
@@ -265,7 +264,7 @@ class WebResearcherTest(unittest.TestCase):
             async def ainvoke(self, prompt: str):
                 self.calls.append(prompt)
                 if "Generate" in prompt and "search queries" in prompt.lower() or "DuckDuckGo" in prompt:
-                    return _FakeResponse('site:wlw.de "overly exact no results"')
+                    return _FakeResponse('wlw.de "overly exact no results"')
                 if "Extract a B2B procurement supplier" in prompt:
                     return _FakeResponse(json.dumps({
                         "name": "Fallback Query Office Supplier",
@@ -296,7 +295,7 @@ class WebResearcherTest(unittest.TestCase):
             async def ainvoke(self, prompt: str):
                 self.calls.append(prompt)
                 if "Generate" in prompt and "search queries" in prompt.lower() or "DuckDuckGo" in prompt:
-                    return _FakeResponse("site:wlw.de office paper folders supplier Germany")
+                    return _FakeResponse("wlw.de office paper folders supplier Germany")
                 if "evaluating web search results" in prompt.lower() or "supplier page" in prompt.lower():
                     return _FakeResponse(json.dumps([{"index": 0, "is_supplier": True, "reason": "only one despite many good candidates"}]))
                 if "Extract a B2B procurement supplier" in prompt:
@@ -313,7 +312,7 @@ class WebResearcherTest(unittest.TestCase):
                 return _FakeResponse("{}")
 
         intent = ProcurementIntent(category="office", country="Germany", keywords=["A4", "paper", "folders"])
-        query = "site:wlw.de office paper folders supplier Germany"
+        query = "wlw.de office paper folders supplier Germany"
         provider = FakeSearchProvider({
             query: [
                 SearchResult(f"Supplier {idx} GmbH Bürobedarf", f"https://supplier{idx}.example/", "A4 paper folders wholesaler Germany")
@@ -332,7 +331,7 @@ class WebResearcherTest(unittest.TestCase):
             async def ainvoke(self, prompt: str):
                 self.calls.append(prompt)
                 if "Generate" in prompt and "search queries" in prompt.lower() or "DuckDuckGo" in prompt:
-                    return _FakeResponse("site:wlw.de retry office supplier Germany")
+                    return _FakeResponse("wlw.de retry office supplier Germany")
                 if "evaluating web search results" in prompt.lower() or "supplier page" in prompt.lower():
                     return _FakeResponse(json.dumps([{"index": 0, "is_supplier": True, "reason": "supplier after retry"}]))
                 if "Extract a B2B procurement supplier" in prompt:
@@ -346,7 +345,7 @@ class WebResearcherTest(unittest.TestCase):
                 return _FakeResponse("{}")
 
         intent = ProcurementIntent(category="office", country="Germany", keywords=["A4", "paper"])
-        query = "site:wlw.de retry office supplier Germany"
+        query = "wlw.de retry office supplier Germany"
         provider = FakeSearchProvider({
             query: [[], [SearchResult("Retry Supplier GmbH", "https://retry.example/", "A4 paper supplier Germany")]]
         })

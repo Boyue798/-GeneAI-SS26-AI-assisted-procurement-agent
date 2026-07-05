@@ -168,6 +168,14 @@ class IntentParser:
                 matches.append((best, category))
         if not matches:
             return None
+
+        # Mixed office-supply requests such as "A4 paper and folders" should
+        # route to the broader office supplier pool. A single concrete paper
+        # request can still remain category="paper" for quote/product gates.
+        matched_categories = {category for _, category in matches}
+        if "paper" in matched_categories and "office" in matched_categories:
+            return "office"
+
         priority = {
             "paper": 30,
             "laptop": 30,
