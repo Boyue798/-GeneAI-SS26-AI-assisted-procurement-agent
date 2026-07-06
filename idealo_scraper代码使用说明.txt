@@ -1,0 +1,159 @@
+Idealo 商品比价爬虫技术说明
+
+1. 网站结构概括
+
+使用的网站为 Idealo（德国比价平台）。
+
+网站整体流程如下：
+
+ Step 1：搜索页面
+
+用户输入商品名称（例如：`Kopierpapier A4`）。
+
+程序会：
+
+1. 打开 Idealo 首页；
+2. 在搜索框中输入商品关键词；
+3. 自动跳转到商品搜索结果页。
+
+搜索结果页包含多个商品，每个商品对应一个详情页面链接。
+
+---
+
+Step 2：商品详情页面
+
+程序进入具体商品页面后，会读取该商品对应的所有商店报价。
+
+例如：
+
+```
+商品：tecno Speed A4 Papier
+
+商店A：2.76 €
+商店B：3.34 €
+商店C：3.46 €
+```
+
+
+Step 3：报价卡片
+
+每个报价卡片通常包含：
+
+* 商店名称（Shop）
+* 商品价格（Price）
+* 总价格（含运费）
+* 配送信息（Delivery）
+* 商店评分（Rating）
+* 评论数量（Reviews）
+* 支付方式（Payment Methods）
+
+程序会逐个读取这些信息，并保存为 JSON 文件。
+
+---
+
+2. 当前设置的数据字段
+
+目前爬虫输出的数据格式如下：
+
+```json
+{
+    "product_name": "",
+    "product_url": "",
+    "offers": [
+        {
+            "shop": "",
+            "price": "",
+            "total_price": "",
+            "shipping": "",
+            "delivery": "",
+            "rating": "",
+            "reviews": "",
+            "payment_methods": []
+        }
+    ]
+}
+```
+
+
+
+3. 如何使用代码
+
+（1）安装依赖
+
+首次运行需要安装：
+
+```
+pip install selenium
+pip install webdriver-manager
+pip install undetected-chromedriver
+```
+
+---
+
+（2）修改搜索关键词
+
+在代码最后部分：
+
+```python
+results = scraper.scrape_search_results(
+    "Kopierpapier A4",
+    limit=5
+)
+```
+
+修改：
+
+```python
+"Kopierpapier A4"
+```
+
+即可搜索其他商品，例如：
+
+```python
+"Toilettenpapier"
+"Monitor"
+"Bürostuhl"
+"Laptop"
+```
+
+---
+
+3）修改抓取数量
+
+```python
+limit=5
+```
+
+表示抓取前 5 个商品。
+
+
+
+---
+
+（4）运行程序
+
+直接运行：
+
+```
+python idealo_scraper.py
+```
+
+程序将：
+
+1. 打开浏览器；
+2. 自动搜索商品；
+3. 自动进入商品详情页；
+4. 抓取所有商店报价；
+5. 保存结果。
+
+---
+
+（5）输出文件
+
+运行结束后会生成：
+
+```
+results.json
+```
+
+该文件可直接作为后续 AI 推荐系统、价格比较模块或数据库的输入数据。
