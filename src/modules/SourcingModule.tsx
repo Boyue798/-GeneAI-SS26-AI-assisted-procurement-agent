@@ -150,7 +150,7 @@ function Field({ label, value, sub }: { label: string; value?: string; sub?: str
 type SearchStatus = 'idle' | 'running' | 'success' | 'empty' | 'error'
 
 function isDatabaseSupplier(supplier: Supplier): boolean {
-  return supplier.source !== 'web'
+  return supplier.source === 'database'
 }
 
 export function SourcingModule({
