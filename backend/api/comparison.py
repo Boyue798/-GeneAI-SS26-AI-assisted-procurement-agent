@@ -21,7 +21,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from api.auth import AuthUser, get_current_user
-
+from db_writer import save_comparison_request_and_quotes
 
 router = APIRouter(prefix="/api/comparison", tags=["comparison"])
 
@@ -130,6 +130,14 @@ async def _run_comparison_job(job_id: str, req: ComparisonSearchRequest, agent: 
         job.results = result.get("results", [])
         job.status = "completed"
         _append_event(job, "completed", "标准品比价表已准备就绪，可以查看推荐结果了。", 100)
+        try:
+          save_comparison_request_and_quotes(
+            request_text=req.query,
+            requested_by=job.owner,
+            items=job.results,
+          )
+        except Exception as e:
+            print(f"[comparison] 保存数据库失败，不影响返回结果: {e}")
     except Exception as exc:  # pragma: no cover - exact production errors vary
         job.status = "failed"
         job.error = str(exc)
@@ -194,6 +202,15 @@ async def search(
             max_price=req.maxPrice,
             delivery_time=req.deliveryTime,
         )
+    try:
+        save_comparison_request_and_quotes(
+            request_text=req.query,
+            requested_by=current_user.email,
+            items=result.get("results", []),
+        )
+    except Exception as e:
+        print(f"[comparison] 保存数据库失败，不影响返回结果: {e}")
+    return result
 
 
 @router.post("/search-jobs", response_model=ComparisonJobResponse, status_code=status.HTTP_202_ACCEPTED)
