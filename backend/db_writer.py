@@ -261,3 +261,132 @@ def save_comparison_request_and_products(
         print(f"[db_writer] 保存 comparison 结果失败: {e}")
     finally:
         conn.close()
+
+
+
+def save_comparison_request_and_quotes(
+    request_text: str,
+    requested_by: str,
+    items: list[dict],
+) -> None:
+    """
+    保存一次 Comparison 搜索：
+      1. 插入 procurement_request
+      2. 遍历 items，确保 supplier 和 product 存在
+      3. 插入 quote 表（按 source_url 去重）
+    """
+    conn = get_connection()
+    if conn is None:
+        print("[db_writer] 无数据库连接，跳过保存 comparison 结果")
+        return
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        cur.execute(
+            """
+            INSERT INTO procurement_request (request_text, requested_by, status)
+            VALUES (%s, %s, %s)
+            RETURNING id
+            """,
+            (request_text, requested_by, "closed"),
+        )
+        conn.commit()
+
+        for item in items:
+            vendor_name = item.get("vendor")
+            product_name = item.get("product")
+
+            if not vendor_name or not product_name:
+                continue
+
+            # ---- 确保 supplier 存在 ----
+            cur.execute("SELECT id FROM supplier WHERE name = %s", (vendor_name,))
+            existing_supplier = cur.fetchone()
+            if existing_supplier:
+                supplier_id = existing_supplier["id"]
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO supplier (name, origin, rating, attributes)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        vendor_name,
+                        "web",
+                        item.get("rating", 0) or 0,
+                        json.dumps({"platform": item.get("platform", "")}, ensure_ascii=False),
+                    ),
+                )
+                supplier_id = cur.fetchone()["id"]
+                conn.commit()
+
+            # ---- 确保 product 存在 ----
+            cur.execute("SELECT id FROM product WHERE name_de = %s", (product_name,))
+            existing_product = cur.fetchone()
+            if existing_product:
+                product_id = existing_product["id"]
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO product (name_de, kind, reference_price, currency, preferred_supplier, attributes)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        product_name,
+                        "standard",
+                        item.get("unitPriceEur"),
+                        "EUR",
+                        supplier_id,
+                        json.dumps({
+                            "platform": item.get("platform"),
+                            "paymentTerm": item.get("paymentTerm"),
+                            "deliveryMethod": item.get("deliveryMethod"),
+                        }, ensure_ascii=False),
+                    ),
+                )
+                product_id = cur.fetchone()["id"]
+                conn.commit()
+
+            # ---- 插入 quote（按 source_url 去重）----
+            source_url = (item.get("sourceUrls") or [""])[0] or ""
+            if source_url:
+                cur.execute("SELECT id FROM quote WHERE source_url = %s", (source_url,))
+                if cur.fetchone():
+                    continue
+
+            cur.execute(
+                """
+                INSERT INTO quote
+                    (product_id, supplier_id, listing_title, price, currency,
+                     lead_time_text, lead_time_days, in_stock, source_url,
+                     score, is_selected, attributes)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    product_id,
+                    supplier_id,
+                    product_name,
+                    item.get("unitPriceEur"),
+                    "EUR",
+                    item.get("deliveryLabel"),
+                    item.get("deliveryDays"),
+                    True,
+                    source_url or None,
+                    (item.get("matchScore", 0) or 0) / 20,
+                    False,
+                    json.dumps({
+                        "platform": item.get("platform"),
+                        "paymentTerm": item.get("paymentTerm"),
+                        "reviews": item.get("reviews"),
+                    }, ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"[db_writer] 保存 comparison 结果失败: {e}")
+    finally:
+        conn.close()
