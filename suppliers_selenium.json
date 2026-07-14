@@ -1,0 +1,57 @@
+[
+    {
+        "url": "https://www.wlw.de/de/firma/fix-auto-nordsachsen-gmbh-22274446",
+        "company_name": "Fix Auto Nordsachsen GmbH",
+        "location": "Deutschland",
+        "description": "Gründe für Fix Auto\n\nFix Auto definiert die Qualitäts- und Servicestandards in der Unfallinstandsetzung neu. Als Teil der Fix Network-Markenfamilie steht Ihnen unser wachsendes Netzwerk von freien, inhabergeführten Karosserie- und Autolackierwerkstätten im Schadenfall kompetent zur Seite.\n\nFür Fix Auto-Reparaturzentren hat Kundenzufriedenheit oberste Priorität. Jede Karosseriewerkstatt bietet Ihnen professionelle Reparaturleistungen, einschließlich zuverlässiger Kostenvoranschläge, modernster Ausrüstung und freundlichem Personal. Bei den Unfallreparatur- und Servicespezialisten von Fix Auto sind Sie in kompetenten Händen.\n\nUnsere Leistungen\nDas Service-Angebot in den Reparaturzentren von Fix Auto reicht von der Behebung kleinerer Schäden wie der Dellenentfernung oder Steinschlagreparatur mittels Smart Repair, über die Fahrzeugaufbereitung bis hin zur Karosserie-Reparatur, Unfallinstandsetzung und großflächigen Autolackierung.",
+        "matched_products": [
+            "Autoglasreparatur und Scheibentausch",
+            "Dellen entfernen",
+            "Fahrzeugdiagnose",
+            "Achsvermessung",
+            "Lackkratzer entfernen",
+            "Unfallinstandsetzung"
+        ],
+        "supplier_type": [
+            "Dienstleister"
+        ],
+        "contact_person": "David Baum - Geschäftsführung",
+        "phone": "+4916097003020",
+        "founding_year": null,
+        "employee_count": null,
+        "delivery_range": "Regional",
+        "certificate_count": 0,
+        "score": 80
+    },
+    {
+        "url": "https://www.wlw.de/de/firma/carcompany-daniel-kovacs-kg-1706177",
+        "company_name": "CARCOMPANY Daniel Kovacs KG",
+        "location": "Österreich",
+        "description": "Windschutzscheibe, Windschutzscheibentausch, Seitenscheibe, Heckscheibe, Steinschlagreperatur, Reifenhandel, Reifenservice, Innenreinigung, Außenreinigung, Scheibentönen, Ölwechsel.",
+        "matched_products": [
+            "Windschutzscheibentausch",
+            "Scheibentönen",
+            "Windschutzscheibe",
+            "Scheinwerfer Restaurierung",
+            "Gebäude Folierung",
+            "Steinschlag",
+            "Seitenscheibe",
+            "Heckscheibe",
+            "Lackschutzfolie",
+            "Steinschlagreparatur",
+            "Heckscheibentausch",
+            "Seitenscheibentausch"
+        ],
+        "supplier_type": [
+            "Dienstleister",
+            "Lieferant"
+        ],
+        "contact_person": "Daniel Kovacs",
+        "phone": "+4312269000",
+        "founding_year": null,
+        "employee_count": "1-4",
+        "delivery_range": "Regional",
+        "certificate_count": 0,
+        "score": 100
+    }
+]
