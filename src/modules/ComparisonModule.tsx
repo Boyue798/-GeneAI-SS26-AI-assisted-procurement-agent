@@ -43,11 +43,11 @@ const JOB_POLL_INTERVAL_MS = 1_500
 
 function isSerpApiItem(item: ComparisonItem): boolean {
   return item.sourceDetail === 'marketplace:serpapi'
-    || item.platform.trim().toLowerCase() === 'google shopping (serpapi)'
+    || (item.platform || '').trim().toLowerCase() === 'google shopping (serpapi)'
 }
 
 function isIdealoItem(item: ComparisonItem): boolean {
-  return item.sourceDetail === 'idealo' || item.platform.trim().toLowerCase().includes('idealo')
+  return item.sourceDetail === 'idealo' || (item.platform || '').trim().toLowerCase().includes('idealo')
 }
 
 function comparisonSourceLabel(item: ComparisonItem, copy: Translation['comparison']): string {
