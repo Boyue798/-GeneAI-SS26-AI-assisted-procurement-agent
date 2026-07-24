@@ -71,6 +71,32 @@ POST /api/auth/login
 
 拿返回的 token 在 Swagger 右上角点 "Authorize" 填入 `Bearer <token>`，之后所有请求自动带认证。
 
+### 可选：快速市场报价 API
+
+标准品比价会先尝试已配置的结构化市场 API；当至少获得 3 条带 EUR 价格的相关商品时，系统才会跳过较慢的补充搜索。未配置任何市场 API 时，Germany（或未选择国家）仍使用 Idealo 加网页搜索；Poland 等明确非德国市场只使用该市场的网页搜索，不会悄悄切换到德国 Idealo。
+
+- `SERPAPI_API_KEY`：启用 SerpApi Google Shopping，是当前首选的快速商品搜索来源。`SERPAPI_COUNTRY=de` 是默认市场；请求中选择 Germany / Poland 等国家时，系统会安全映射为 Google Shopping 的 `gl`、`hl` 与 `google_domain` 参数。仅保留响应中明确标为 EUR / € 的公开报价，不会自动换汇。Poland 市场通常返回 PLN，因此只有该市场本身给出 EUR 报价时才进入 EUR 比价表；不足时补充 Poland 相关网页搜索，不会改用 Idealo 德国市场。`Europe` / `EU` 不是单一 Google Shopping 市场，系统不会将其自动映射为 Germany。
+- `EBAY_CLIENT_ID` 与 `EBAY_CLIENT_SECRET`：启用官方 eBay Browse API，默认市场为 `EBAY_DE`。
+- `MARKETPLACE_API_URL`：启用通用只读 JSON 连接器。默认以 `GET` 发送 `query`、`limit`、`country`；只有目标 API 明确要求时才设置 `MARKETPLACE_API_METHOD=POST`。
+- 通用连接器接受 `items`、`results`、`data`、`offers` 等数组容器，并标准化常见字段：`title`/`product`、`url`/`itemWebUrl`、`price`/`unitPriceEur`、`currency`。
+
+示例响应：
+
+```json
+{
+  "items": [
+    {
+      "title": "HP EliteBook 840 G9",
+      "url": "https://approved-marketplace.example/items/123",
+      "price": { "value": "841.17", "currency": "EUR" },
+      "sellerName": "Approved seller"
+    }
+  ]
+}
+```
+
+SerpApi 的密钥由组织自己的 SerpApi 账号提供，系统不包含演示或共享密钥。Idealo 仅作为 Germany 或未选择国家时未满足价格门槛的公开网页补充来源。系统不会把 Amazon、Taobao 或其他市场默认视为已接入；每个市场都需要单独的、已授权的 API 集成与凭据。完整环境变量见 `.env.example`。
+
 ---
 
 ## 部署

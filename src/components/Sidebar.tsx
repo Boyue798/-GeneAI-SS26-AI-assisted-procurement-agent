@@ -14,9 +14,9 @@ export function Sidebar({
   t: Translation
 }) {
   return (
-    <aside className="relative z-10 flex w-[260px] shrink-0 flex-col overflow-y-auto bg-slate-900 text-slate-300 shadow-[4px_0_10px_rgba(0,0,0,0.1)] print:hidden">
+    <aside className="procurement-sidebar relative z-10 flex shrink-0 flex-col overflow-y-auto print:hidden">
       <nav className="flex-1 space-y-1 px-3 py-4">
-        <p className="mb-2 px-3 text-[11px] font-medium uppercase tracking-wider text-slate-500">
+        <p className="procurement-nav-label mb-2 px-3">
           {t.nav.modules}
         </p>
         {MODULE_ORDER.map((id) => {
@@ -27,13 +27,12 @@ export function Sidebar({
               key={id}
               type="button"
               onClick={() => onChange(id)}
-              className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm font-medium transition-colors ${
-                isActive
-                  ? 'bg-blue-600 text-white shadow-md shadow-blue-900/30'
-                  : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+              aria-current={isActive ? 'page' : undefined}
+              className={`procurement-nav-item flex w-full items-center gap-3 px-3 py-2.5 text-left text-sm font-medium ${
+                isActive ? 'is-active' : ''
               }`}
             >
-              <span className={isActive ? 'text-white' : 'text-slate-500'}>
+              <span className="procurement-nav-icon">
                 <Icon className="h-5 w-5" />
               </span>
               {t.nav[id]}
@@ -41,7 +40,7 @@ export function Sidebar({
           )
         })}
       </nav>
-      <div className="px-5 py-4 text-[11px] text-slate-600">{t.tagline}</div>
+      <div className="procurement-sidebar-footer px-5 py-4 text-[11px]">{t.tagline}</div>
     </aside>
   )
 }

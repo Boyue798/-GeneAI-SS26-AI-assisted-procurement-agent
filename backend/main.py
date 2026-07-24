@@ -12,7 +12,11 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # Keep offline/web-only mode bootable with launcher-provided env vars.
+    def load_dotenv(*args, **kwargs):
+        return False
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
@@ -24,6 +28,7 @@ from api.auth import router as auth_router
 from api.comparison import router as comparison_router
 from api.conversations import router as conversations_router
 from api.sourcing import router as sourcing_router
+from api.suppliers import router as suppliers_router
 from api.vault import router as vault_router
 
 
@@ -121,6 +126,7 @@ app.include_router(vault_router)
 app.include_router(conversations_router)
 app.include_router(sourcing_router)
 app.include_router(comparison_router)
+app.include_router(suppliers_router)
 
 
 # ---------------------------------------------------------------------------

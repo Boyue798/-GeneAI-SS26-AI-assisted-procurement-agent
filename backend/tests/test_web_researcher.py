@@ -95,9 +95,9 @@ class StubLLM:
         self.calls.append(prompt)
         if "Generate" in prompt and "search queries" in prompt.lower() or "DuckDuckGo" in prompt:
             return _FakeResponse("\n".join([
-                "site:wlw.de Bürobedarf A4 Papier Ordner Lieferant Deutschland",
-                "site:europages.de A4 Papier Ordner Deutschland Bürobedarf",
-                "site:lieferanten.de A4 Papier Ordner Bürobedarf",
+                "wlw.de Bürobedarf A4 Papier Ordner Lieferant Deutschland",
+                "europages.de A4 Papier Ordner Deutschland Bürobedarf",
+                "lieferanten.de A4 Papier Ordner Bürobedarf",
                 "A4 Papier Ordner Lieferant Deutschland B2B Großhandel -Amazon -eBay -Pinterest",
                 "office supplies wholesaler Germany A4 paper folders B2B -amazon -ebay",
             ]))
@@ -144,24 +144,23 @@ class WebResearcherTest(unittest.TestCase):
         joined = "\n".join(queries).lower()
 
         self.assertGreaterEqual(len(queries), 5)
-        self.assertIn("site:wlw.de", joined)
-        self.assertIn("site:europages", joined)
-        self.assertIn("-amazon", joined)
-        self.assertIn("-ebay", joined)
+        self.assertIn("wlw.de", joined)
+        self.assertIn("europages", joined)
+        self.assertNotIn("site:", joined)
         self.assertNotIn("automotive supplier", joined)
 
     def test_research_with_llm_driven_pipeline_yields_real_suppliers(self):
         intent = ProcurementIntent(category="office", country="Germany", keywords=["A4", "Papier", "Ordner"])
         provider = FakeSearchProvider({
-            "site:wlw.de Bürobedarf A4 Papier Ordner Lieferant Deutschland": [
+            "wlw.de Bürobedarf A4 Papier Ordner Lieferant Deutschland": [
                 SearchResult(title="Office 365 login", url="https://www.office.com/", snippet="Microsoft login"),
                 SearchResult(title="Viking Office Deutschland Bürobedarf", url="https://www.viking.de/", snippet="A4 Papier Ordner supplier"),
                 SearchResult(title="OTTO Office Bürobedarf", url="https://www.otto-office.com/de/", snippet="Kopierpapier Büromaterial"),
             ],
-            "site:europages.de A4 Papier Ordner Deutschland Bürobedarf": [
+            "europages.de A4 Papier Ordner Deutschland Bürobedarf": [
                 SearchResult(title="Viking Office Deutschland Bürobedarf", url="https://www.viking.de/", snippet="A4 Papier Ordner supplier"),
             ],
-            "site:lieferanten.de A4 Papier Ordner Bürobedarf": [],
+            "lieferanten.de A4 Papier Ordner Bürobedarf": [],
             "A4 Papier Ordner Lieferant Deutschland B2B Großhandel -Amazon -eBay -Pinterest": [
                 SearchResult(title="Viking Office Deutschland Bürobedarf", url="https://www.viking.de/", snippet="A4 Papier Ordner supplier"),
             ],
@@ -212,13 +211,96 @@ class WebResearcherTest(unittest.TestCase):
         self.assertTrue(researcher._is_noisy_page(""))  # too short to be useful text
         self.assertFalse(researcher._is_noisy_page("German office-supplies supplier for paper and folders"))
 
+    def test_supplier_eligibility_rejects_directory_registry_and_news_pages(self):
+        intent = ProcurementIntent(
+            category="glassAdhesive",
+            country="Germany",
+            keywords=["Teroson", "IATF 16949"],
+            certifications=["IATF 16949"],
+        )
+        researcher = WebResearcher(search_provider=FakeSearchProvider(), page_fetcher=FakePageFetcher())
+
+        rejected = [
+            SearchResult(
+                "Manufacturer Directory Europe: Source from 2900+ Verified Suppliers",
+                "https://manufacturer-directory.example/europe",
+                "Find suppliers and companies",
+            ),
+            SearchResult(
+                "214620 - Turk Henkel - IATF",
+                "https://www.iatfglobaloversight.org/certificate/214620",
+                "IATF certificate record",
+            ),
+            SearchResult(
+                "Roehm at the Paris Airshow",
+                "https://www.roehm.example/news/paris-airshow",
+                "Aviation materials news",
+            ),
+            SearchResult(
+                "Polyurethanklebstoff - alle Hersteller aus dem Bereich der Industrie",
+                "https://www.directindustry.de/industrie-hersteller/polyurethanklebstoff-229967.html",
+                "Polyurethane adhesive manufacturer directory",
+            ),
+            SearchResult(
+                "Hochdach verkleben - Welcher Kleber?",
+                "https://www.t4forum.de/forum/index.php?thread/259585",
+                "Forum discussion about Sika adhesive",
+            ),
+        ]
+        for result in rejected:
+            self.assertFalse(researcher._is_candidate_result_eligible(result, intent), result)
+
+        valid = SearchResult(
+            "HENKEL TEROSON GMBH - Klebstoffe fuer die Automobilindustrie",
+            "https://www.europages.de/HENKEL-TEROSON-GMBH/company.html",
+            "Polyurethane windscreen adhesive manufacturer",
+        )
+        self.assertTrue(researcher._is_candidate_result_eligible(valid, intent))
+
+        generic_adhesive = SearchResult(
+            "About us - Certoplast",
+            "https://certoplast.example/company/about-us",
+            "Industrial adhesive tape company, IATF 16949 certified",
+        )
+        self.assertFalse(researcher._is_candidate_result_eligible(generic_adhesive, intent))
+
+    def test_normalization_does_not_promote_request_terms_to_page_evidence(self):
+        intent = ProcurementIntent(
+            category="glassAdhesive",
+            country="Germany",
+            keywords=["Teroson", "IATF 16949"],
+            certifications=["IATF 16949"],
+        )
+        researcher = WebResearcher(search_provider=FakeSearchProvider(), page_fetcher=FakePageFetcher())
+        item = researcher._normalize_supplier(
+            {"name": "Evidence-light page"},
+            SearchResult("Evidence-light page", "https://supplier.example/", "Company profile"),
+            intent,
+            source="web-research",
+        )
+        self.assertEqual(item["products"], [])
+        self.assertEqual(item["certifications"], [])
+
+    def test_observed_product_values_do_not_treat_certification_as_a_product(self):
+        intent = ProcurementIntent(
+            category="glassAdhesive",
+            country="Germany",
+            keywords=["IATF", "16949", "Germany", "IATF 16949"],
+            certifications=["IATF 16949"],
+        )
+        self.assertEqual(WebResearcher._observed_product_values("IATF 16949 certified company in Germany", intent), [])
+        self.assertIn(
+            "adhesive",
+            WebResearcher._observed_product_values("Industrial adhesive manufacturer, IATF 16949 certified", intent),
+        )
+
     def test_rule_fallback_without_llm_still_works(self):
         intent = ProcurementIntent(category="office", country="Germany", keywords=["Bürobedarf"])
         provider = FakeSearchProvider({
-            "site:wlw.de Bürobedarf Lieferant office": [
+            "wlw.de Bürobedarf Lieferant office": [
                 SearchResult("Bürobedarf Müller GmbH - Lieferant", "https://www.europages.de/BUEROBEDARF-MUELLER/000000.html", "Bürobedarf Lieferant Deutschland"),
             ],
-            "site:europages.de Bürobedarf Deutschland office": [
+            "europages.de Bürobedarf Deutschland office": [
                 SearchResult("Papier Großhandel Schmidt KG", "https://www.europages.de/papier/", "Großhandel Papier Deutschland"),
             ],
         })
@@ -235,6 +317,17 @@ class WebResearcherTest(unittest.TestCase):
         self.assertGreaterEqual(len(suppliers), 3)
         for s in suppliers:
             self.assertEqual(s["category"], "office")
+
+    def test_paper_request_uses_office_fallback_when_search_is_empty(self):
+        intent = ProcurementIntent(category="paper", country="Germany", keywords=["A4", "paper"])
+        researcher = WebResearcher(search_provider=FakeSearchProvider(), page_fetcher=FakePageFetcher())
+
+        suppliers = asyncio.run(researcher.research(intent, max_suppliers=4))
+
+        self.assertGreaterEqual(len(suppliers), 4)
+        self.assertTrue(all(supplier["category"] == "paper" for supplier in suppliers))
+        self.assertTrue(any("A4 Papier" in supplier["products"] for supplier in suppliers))
+
     def test_deep_supplier_research_fetches_product_contact_and_impressum_pages(self):
         intent = ProcurementIntent(category="office", country="Germany", keywords=["A4", "paper", "folders"])
         fetcher = DeepFakePageFetcher()
@@ -265,7 +358,7 @@ class WebResearcherTest(unittest.TestCase):
             async def ainvoke(self, prompt: str):
                 self.calls.append(prompt)
                 if "Generate" in prompt and "search queries" in prompt.lower() or "DuckDuckGo" in prompt:
-                    return _FakeResponse('site:wlw.de "overly exact no results"')
+                    return _FakeResponse('wlw.de "overly exact no results"')
                 if "Extract a B2B procurement supplier" in prompt:
                     return _FakeResponse(json.dumps({
                         "name": "Fallback Query Office Supplier",
@@ -296,7 +389,7 @@ class WebResearcherTest(unittest.TestCase):
             async def ainvoke(self, prompt: str):
                 self.calls.append(prompt)
                 if "Generate" in prompt and "search queries" in prompt.lower() or "DuckDuckGo" in prompt:
-                    return _FakeResponse("site:wlw.de office paper folders supplier Germany")
+                    return _FakeResponse("wlw.de office paper folders supplier Germany")
                 if "evaluating web search results" in prompt.lower() or "supplier page" in prompt.lower():
                     return _FakeResponse(json.dumps([{"index": 0, "is_supplier": True, "reason": "only one despite many good candidates"}]))
                 if "Extract a B2B procurement supplier" in prompt:
@@ -313,7 +406,7 @@ class WebResearcherTest(unittest.TestCase):
                 return _FakeResponse("{}")
 
         intent = ProcurementIntent(category="office", country="Germany", keywords=["A4", "paper", "folders"])
-        query = "site:wlw.de office paper folders supplier Germany"
+        query = "wlw.de office paper folders supplier Germany"
         provider = FakeSearchProvider({
             query: [
                 SearchResult(f"Supplier {idx} GmbH Bürobedarf", f"https://supplier{idx}.example/", "A4 paper folders wholesaler Germany")
@@ -332,7 +425,7 @@ class WebResearcherTest(unittest.TestCase):
             async def ainvoke(self, prompt: str):
                 self.calls.append(prompt)
                 if "Generate" in prompt and "search queries" in prompt.lower() or "DuckDuckGo" in prompt:
-                    return _FakeResponse("site:wlw.de retry office supplier Germany")
+                    return _FakeResponse("wlw.de retry office supplier Germany")
                 if "evaluating web search results" in prompt.lower() or "supplier page" in prompt.lower():
                     return _FakeResponse(json.dumps([{"index": 0, "is_supplier": True, "reason": "supplier after retry"}]))
                 if "Extract a B2B procurement supplier" in prompt:
@@ -346,7 +439,7 @@ class WebResearcherTest(unittest.TestCase):
                 return _FakeResponse("{}")
 
         intent = ProcurementIntent(category="office", country="Germany", keywords=["A4", "paper"])
-        query = "site:wlw.de retry office supplier Germany"
+        query = "wlw.de retry office supplier Germany"
         provider = FakeSearchProvider({
             query: [[], [SearchResult("Retry Supplier GmbH", "https://retry.example/", "A4 paper supplier Germany")]]
         })

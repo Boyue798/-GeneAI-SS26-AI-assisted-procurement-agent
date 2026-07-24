@@ -55,6 +55,7 @@ export interface Translation {
     saved: string
     empty: string
     searchError: string
+    searchTimeout: string
   }
 
   sourcing: {
@@ -70,11 +71,29 @@ export interface Translation {
     unit: string
     brand: string
     brandPlaceholder: string
+    model: string
+    modelPlaceholder: string
+    specifications: string
+    specificationsPlaceholder: string
+    standards: string
+    standardsPlaceholder: string
     structuredCategory: string
     structuredCountry: string
     countryPlaceholder: string
     structuredCerts: string
     certsPlaceholder: string
+    criteriaTitle: string
+    criteriaHint: string
+    criteriaAdd: string
+    criteriaPlaceholder: string
+    criteriaWeight: string
+    criteriaRemove: string
+    criteriaPresetQuality: string
+    criteriaPresetReputation: string
+    criteriaPresetMoq: string
+    criteriaPresetCapacity: string
+    criteriaPresetRegion: string
+    criteriaPresetEnvironment: string
     units: { pcs: string; kg: string; m: string; set: string }
     categoryLabel: string
     categoryAll: string
@@ -87,17 +106,49 @@ export interface Translation {
     cardEstablished: string
     cardCapabilities: string
     cardCerts: string
+    cardProduct: string
+    cardSpecifications: string
+    cardQuote: string
+    cardLeadTime: string
+    cardPaymentTerms: string
+    cardVerification: string
     cardEvidence: string
     cardSources: string
     sourceLabel: string
     localDatabaseTag: string
     webSearchTag: string
     allWebNotice: string
+    recommendationTitle: string
+    recommendationLead: string
+    recommendationReasons: string
+    recommendationRisks: string
+    recommendationNoRisk: string
+    recommendationLocal: string
+    recommendationProduct: string
+    recommendationCertifications: string
+    recommendationWebRisk: string
+    recommendationContactRisk: string
+    recommendationQuoteRisk: string
+    recommendationDeliveryRisk: string
+    recommendationPaymentRisk: string
+    recommendationCompared: string
     match: string
     colName: string
     colLocation: string
     colEmail: string
     colWebsite: string
+    colProduct: string
+    colBrand: string
+    colModel: string
+    colSpecifications: string
+    colStandards: string
+    colUnitPrice: string
+    colQuoteConditions: string
+    colLeadTime: string
+    colPaymentTerms: string
+    colSources: string
+    expandDetails: string
+    collapseDetails: string
     agentProgress: {
       eyebrow: string
       runningTitle: string
@@ -107,6 +158,10 @@ export interface Translation {
       thoughtLogLabel: string
       emptyText: string
       activeLabel: string
+      messagesLabel: string
+      searchesLabel: string
+      pagesLabel: string
+      pricesLabel: string
     }
   }
 
@@ -127,6 +182,9 @@ export interface Translation {
     hardFilters: string
     budget: string
     delivery: string
+    targetMarket: string
+    targetMarketOptions: { any: string; Germany: string; Poland: string }
+    polandCurrencyNotice: string
     minPrice: string
     maxPrice: string
     deliveryOptions: { unlimited: string; within3: string; within7: string }
@@ -135,6 +193,8 @@ export interface Translation {
     weightPrice: string
     weightDelivery: string
     weightRating: string
+    customCriteriaTitle: string
+    customCriteriaHint: string
     tableTitle: string
     colVendor: string
     colPlatform: string
@@ -151,8 +211,22 @@ export interface Translation {
     sourceLabel: string
     sourceLocal: string
     sourceWeb: string
+    sourceSerpApi: string
+    sourceIdealo: string
+    sourceMarketplaceApi: string
+    priceVerification: string
+    sourceLinks: string
+    priceEvidence: string
+    priceFromMarketplaceApi: string
+    priceFromSerpApi: string
+    priceExtracted: string
     webNeedsManualCheck: string
+    missingDelivery: string
+    missingPayment: string
+    missingDeliveryMethod: string
+    noMatches: string
     allWebNotice: string
+    allMarketplaceApiNotice: string
     agentProgress: {
       eyebrow: string
       runningTitle: string
@@ -162,6 +236,10 @@ export interface Translation {
       thoughtLogLabel: string
       emptyText: string
       activeLabel: string
+      messagesLabel: string
+      searchesLabel: string
+      pagesLabel: string
+      pricesLabel: string
     }
     paymentTerms: Record<PaymentTermKey, string>
   }
@@ -226,6 +304,45 @@ export interface Translation {
     name: string
     company: string
     role: string
+  }
+
+  supplierDirectory: {
+    title: string
+    description: string
+    addSupplier: string
+    editSupplier: string
+    companyName: string
+    country: string
+    city: string
+    contact: string
+    email: string
+    phone: string
+    website: string
+    capabilities: string
+    certifications: string
+    tags: string
+    tagsHint: string
+    notes: string
+    saveSupplier: string
+    updateSupplier: string
+    cancel: string
+    deleteSupplier: string
+    confirmDelete: string
+    empty: string
+    localOnly: string
+    created: string
+    updated: string
+    preferredTag: string
+    reliableTag: string
+    preferred: string
+    performanceNote: string
+    performancePlaceholder: string
+    minimumOrderQuantity: string
+    productionCapacity: string
+    environmentalStandards: string
+    saving: string
+    loadError: string
+    saveError: string
   }
 }
 
@@ -292,6 +409,7 @@ export const translations: Record<Language, Translation> = {
       saved: 'Saved',
       empty: 'No data yet.',
       searchError: 'Search failed — could not reach the server. Please try again.',
+      searchTimeout: 'Search timed out — the server took too long to respond. Please try again.',
     },
     sourcing: {
       inputLabel: 'What are you sourcing?',
@@ -307,11 +425,29 @@ export const translations: Record<Language, Translation> = {
       unit: 'Unit',
       brand: 'Brand (optional)',
       brandPlaceholder: 'e.g. Bosch, Henkel',
+      model: 'Model (optional)',
+      modelPlaceholder: 'e.g. TS 1234',
+      specifications: 'Specifications (optional)',
+      specificationsPlaceholder: 'e.g. EPDM, 20 × 8 mm',
+      standards: 'Standards (optional)',
+      standardsPlaceholder: 'e.g. DIN, ISO 9001',
       structuredCategory: 'Category',
       structuredCountry: 'Target region',
       countryPlaceholder: 'e.g. Germany',
       structuredCerts: 'Certifications (optional)',
       certsPlaceholder: 'e.g. DIN, ISO 9001',
+      criteriaTitle: 'Decision criteria and weights',
+      criteriaHint: 'Set the dimensions that matter for this sourcing run. The agent normalizes the weights to 100%.',
+      criteriaAdd: 'Add criterion',
+      criteriaPlaceholder: 'e.g. Packaging compatibility',
+      criteriaWeight: 'Weight',
+      criteriaRemove: 'Remove',
+      criteriaPresetQuality: 'Product quality',
+      criteriaPresetReputation: 'Supplier reputation',
+      criteriaPresetMoq: 'Minimum order quantity',
+      criteriaPresetCapacity: 'Production capacity',
+      criteriaPresetRegion: 'Regional fit',
+      criteriaPresetEnvironment: 'Environmental standards',
       units: { pcs: 'pcs', kg: 'kg', m: 'm', set: 'set' },
       categoryLabel: 'Category',
       categoryAll: 'All categories',
@@ -331,17 +467,49 @@ export const translations: Record<Language, Translation> = {
       cardEstablished: 'Established',
       cardCapabilities: 'Core capabilities',
       cardCerts: 'Certifications',
+      cardProduct: 'Product evidence',
+      cardSpecifications: 'Specifications & standards',
+      cardQuote: 'Quote conditions',
+      cardLeadTime: 'Lead time',
+      cardPaymentTerms: 'Payment terms',
+      cardVerification: 'Verification status',
       cardEvidence: 'Evidence from crawled pages',
       cardSources: 'Sources opened by Agent',
       sourceLabel: 'Source',
       localDatabaseTag: 'Local database',
       webSearchTag: 'Web search',
       allWebNotice: 'No matching supplier was found in the local database. All displayed results come from web research.',
+      recommendationTitle: 'Recommendation brief',
+      recommendationLead: 'Top candidate',
+      recommendationReasons: 'Why it is recommended',
+      recommendationRisks: 'Risks or missing information',
+      recommendationNoRisk: 'No material gap is visible in the current profile. Confirm commercial details before award.',
+      recommendationLocal: 'Available in the curated local supplier directory.',
+      recommendationProduct: 'Product evidence is available for the requested scope.',
+      recommendationCertifications: 'Relevant certifications are recorded.',
+      recommendationWebRisk: 'Web-sourced profile: verify the information directly with the supplier.',
+      recommendationContactRisk: 'No direct contact detail is available.',
+      recommendationQuoteRisk: 'Unit pricing or quote conditions are not yet confirmed.',
+      recommendationDeliveryRisk: 'Delivery lead time is not yet confirmed.',
+      recommendationPaymentRisk: 'Payment terms are not yet confirmed.',
+      recommendationCompared: 'Match-score lead over next candidate',
       match: 'match',
       colName: 'Supplier',
       colLocation: 'Location',
       colEmail: 'Email',
       colWebsite: 'Website',
+      colProduct: 'Product',
+      colBrand: 'Brand',
+      colModel: 'Model',
+      colSpecifications: 'Specifications',
+      colStandards: 'Standards',
+      colUnitPrice: 'Unit price',
+      colQuoteConditions: 'Quote conditions',
+      colLeadTime: 'Lead time',
+      colPaymentTerms: 'Payment terms',
+      colSources: 'Source links',
+      expandDetails: 'Show supplier details',
+      collapseDetails: 'Hide supplier details',
       agentProgress: {
         eyebrow: 'Procurement Agent thinking',
         runningTitle: 'Procurement Agent is thinking',
@@ -352,6 +520,10 @@ export const translations: Record<Language, Translation> = {
         thoughtLogLabel: 'Agent thought log',
         emptyText: 'Waiting for the first thought from the backend agent...',
         activeLabel: 'Working live — new steps will appear here',
+        messagesLabel: 'Messages',
+        searchesLabel: 'Searches',
+        pagesLabel: 'Pages opened',
+        pricesLabel: 'Prices extracted',
       },
     },
     comparison: {
@@ -372,6 +544,13 @@ export const translations: Record<Language, Translation> = {
       hardFilters: 'Pre-filter conditions (Hard Filters)',
       budget: 'Budget limit',
       delivery: 'Delivery time',
+      targetMarket: 'Target market',
+      targetMarketOptions: {
+        any: 'No explicit market',
+        Germany: 'Germany',
+        Poland: 'Poland',
+      },
+      polandCurrencyNotice: 'Poland: only EUR-priced API offers are compared; PLN results use the web fallback.',
       minPrice: 'Min',
       maxPrice: 'Max',
       deliveryOptions: {
@@ -384,6 +563,8 @@ export const translations: Record<Language, Translation> = {
       weightPrice: 'Price',
       weightDelivery: 'Delivery',
       weightRating: 'Reviews',
+      customCriteriaTitle: 'Additional evaluation dimensions',
+      customCriteriaHint: 'Add the business criteria that should influence a close quote decision; their weights are normalized separately.',
       tableTitle: 'Decision comparison table',
       colVendor: 'Vendor',
       colPlatform: 'Platform',
@@ -400,8 +581,22 @@ export const translations: Record<Language, Translation> = {
       sourceLabel: 'Source',
       sourceLocal: 'Local quote DB',
       sourceWeb: 'Web search',
+      sourceSerpApi: 'SerpApi · Google Shopping',
+      sourceIdealo: 'Idealo price comparison',
+      sourceMarketplaceApi: 'Marketplace API',
+      priceVerification: 'Price verification',
+      sourceLinks: 'Source links',
+      priceEvidence: 'Price evidence',
+      priceFromMarketplaceApi: 'Marketplace API price',
+      priceFromSerpApi: 'SerpApi marketplace price',
+      priceExtracted: 'Product page extraction',
       webNeedsManualCheck: 'Needs manual price check',
+      missingDelivery: 'Needs delivery check',
+      missingPayment: 'Needs payment check',
+      missingDeliveryMethod: 'Needs shipping check',
+      noMatches: 'No quotes match the current filters. Adjust the budget, delivery time, or target market and try again.',
       allWebNotice: 'No local quote matched this request. The displayed candidates come from web search and may need manual price/delivery verification.',
+      allMarketplaceApiNotice: 'No local quote matched this request. The displayed prices come from a configured marketplace API; confirm final shipping, tax, and availability before ordering.',
       agentProgress: {
         eyebrow: 'Procurement Agent thinking',
         runningTitle: 'Procurement Agent is comparing quotes',
@@ -412,11 +607,16 @@ export const translations: Record<Language, Translation> = {
         thoughtLogLabel: 'Agent thought log',
         emptyText: 'Waiting for the first thought from the backend agent...',
         activeLabel: 'Working live — new steps will appear here',
+        messagesLabel: 'Messages',
+        searchesLabel: 'Searches',
+        pagesLabel: 'Pages opened',
+        pricesLabel: 'Prices extracted',
       },
       paymentTerms: {
         onAccount: 'On account',
         prepayment: 'Prepayment',
         card: 'Card / PayPal',
+        unknown: 'To confirm',
       },
     },
     memory: {
@@ -478,6 +678,44 @@ export const translations: Record<Language, Translation> = {
       name: 'Name',
       company: 'Company',
       role: 'Role',
+    },
+    supplierDirectory: {
+      title: 'Local supplier directory',
+      description: 'Maintain your approved suppliers, contact evidence, and performance tags. These records are prioritized during sourcing.',
+      addSupplier: 'Add supplier',
+      editSupplier: 'Edit supplier',
+      companyName: 'Company name',
+      country: 'Country / region',
+      city: 'City',
+      contact: 'Contact person',
+      email: 'Email',
+      phone: 'Phone',
+      website: 'Website',
+      capabilities: 'Capabilities',
+      certifications: 'Certifications',
+      tags: 'Procurement tags',
+      tagsHint: 'Separate tags with commas. Example: Approved supplier, Strong past performance.',
+      notes: 'Internal notes',
+      saveSupplier: 'Save supplier',
+      updateSupplier: 'Update supplier',
+      cancel: 'Cancel',
+      deleteSupplier: 'Delete',
+      confirmDelete: 'Delete this local supplier record? This cannot be undone.',
+      empty: 'No local suppliers yet. Add approved or trusted suppliers to prioritize them in future searches.',
+      localOnly: 'Local record',
+      created: 'Created',
+      updated: 'Updated',
+      preferredTag: 'Approved supplier',
+      reliableTag: 'Strong past performance',
+      preferred: 'Prioritize this supplier in future searches',
+      performanceNote: 'Historical performance',
+      performancePlaceholder: 'e.g. On-time delivery 96%; quality rating 4.7/5',
+      minimumOrderQuantity: 'Minimum order quantity',
+      productionCapacity: 'Production capacity',
+      environmentalStandards: 'Environmental standards',
+      saving: 'Saving...',
+      loadError: 'Could not load the supplier directory. Your existing records are still safe.',
+      saveError: 'Could not save this supplier. Please try again.',
     },
   },
 
@@ -543,6 +781,7 @@ export const translations: Record<Language, Translation> = {
       saved: '已保存',
       empty: '暂无数据。',
       searchError: '检索失败——无法连接服务器，请重试。',
+      searchTimeout: '检索超时——服务器响应时间过长，请重试。',
     },
     sourcing: {
       inputLabel: '您要寻找什么供应商？',
@@ -557,11 +796,29 @@ export const translations: Record<Language, Translation> = {
       unit: '单位',
       brand: '品牌（可选）',
       brandPlaceholder: '例如：Bosch、Henkel',
+      model: '型号（可选）',
+      modelPlaceholder: '例如：TS 1234',
+      specifications: '规格（可选）',
+      specificationsPlaceholder: '例如：EPDM，20 × 8 mm',
+      standards: '标准（可选）',
+      standardsPlaceholder: '例如：DIN、ISO 9001',
       structuredCategory: '品类',
       structuredCountry: '目标地区',
       countryPlaceholder: '例如：德国',
       structuredCerts: '认证要求（可选）',
       certsPlaceholder: '例如：DIN、ISO 9001',
+      criteriaTitle: '评价标准与权重',
+      criteriaHint: '设置本次寻源最重要的维度，系统会自动将权重规范为 100%。',
+      criteriaAdd: '添加维度',
+      criteriaPlaceholder: '例如：包装兼容性',
+      criteriaWeight: '权重',
+      criteriaRemove: '移除',
+      criteriaPresetQuality: '产品质量',
+      criteriaPresetReputation: '供应商信誉',
+      criteriaPresetMoq: '最低订购量',
+      criteriaPresetCapacity: '生产能力',
+      criteriaPresetRegion: '地区匹配度',
+      criteriaPresetEnvironment: '环保标准',
       units: { pcs: '个', kg: '千克', m: '米', set: '套' },
       categoryLabel: '品类',
       categoryAll: '全部品类',
@@ -581,17 +838,49 @@ export const translations: Record<Language, Translation> = {
       cardEstablished: '成立年份',
       cardCapabilities: '核心能力',
       cardCerts: '资质认证',
+      cardProduct: '产品证据',
+      cardSpecifications: '规格与标准',
+      cardQuote: '报价条件',
+      cardLeadTime: '交付周期',
+      cardPaymentTerms: '付款方式',
+      cardVerification: '信息核验状态',
       cardEvidence: '爬取页面证据',
       cardSources: 'Agent 打开的来源页面',
       sourceLabel: '来源',
       localDatabaseTag: '本地数据库',
       webSearchTag: '网络搜索',
       allWebNotice: '本地数据库没有找到相应供应商，当前显示的结果全部来源于网络搜索。',
+      recommendationTitle: '推荐简报',
+      recommendationLead: '首选候选',
+      recommendationReasons: '推荐原因',
+      recommendationRisks: '风险或待补充信息',
+      recommendationNoRisk: '当前资料未发现明显缺口；下单前仍请确认商务条款。',
+      recommendationLocal: '已纳入企业维护的本地供应商资料库。',
+      recommendationProduct: '具备与本次需求相关的产品证据。',
+      recommendationCertifications: '已记录相关认证或资质。',
+      recommendationWebRisk: '网络来源资料：请与供应商直接核验。',
+      recommendationContactRisk: '尚缺少直接联系方式。',
+      recommendationQuoteRisk: '单价或报价条件尚未确认。',
+      recommendationDeliveryRisk: '交付周期尚未确认。',
+      recommendationPaymentRisk: '付款方式尚未确认。',
+      recommendationCompared: '相较下一候选的匹配度优势',
       match: '匹配度',
       colName: '供应商',
       colLocation: '所在地',
       colEmail: '邮箱',
       colWebsite: '网站',
+      colProduct: '产品名称',
+      colBrand: '品牌',
+      colModel: '型号',
+      colSpecifications: '产品规格',
+      colStandards: '标准',
+      colUnitPrice: '单价',
+      colQuoteConditions: '报价条件',
+      colLeadTime: '交付周期',
+      colPaymentTerms: '付款方式',
+      colSources: '来源链接',
+      expandDetails: '展开供应商详情',
+      collapseDetails: '收起供应商详情',
       agentProgress: {
         eyebrow: '采购 Agent 思考中',
         runningTitle: '采购 Agent 正在思考',
@@ -601,6 +890,10 @@ export const translations: Record<Language, Translation> = {
         thoughtLogLabel: 'Agent 思考流',
         emptyText: '正在等待后端 Agent 的第一条思考...',
         activeLabel: '正在实时工作，新步骤会自动出现',
+        messagesLabel: '消息',
+        searchesLabel: '搜索',
+        pagesLabel: '开页',
+        pricesLabel: '抽价',
       },
     },
     comparison: {
@@ -620,6 +913,13 @@ export const translations: Record<Language, Translation> = {
       hardFilters: '前置条件过滤 (Hard Filters)',
       budget: '价格区间',
       delivery: '配送时效',
+      targetMarket: '目标市场',
+      targetMarketOptions: {
+        any: '不指定市场',
+        Germany: '德国',
+        Poland: '波兰',
+      },
+      polandCurrencyNotice: '波兰：仅纳入欧元报价；兹罗提结果将由网页来源补充。',
       minPrice: '最低',
       maxPrice: '最高',
       deliveryOptions: {
@@ -632,6 +932,8 @@ export const translations: Record<Language, Translation> = {
       weightPrice: '价格',
       weightDelivery: '货期',
       weightRating: '评价',
+      customCriteriaTitle: '补充评价维度',
+      customCriteriaHint: '可增加影响临近报价决策的业务维度；这些维度的权重会单独规范为 100%。',
       tableTitle: '决策对比表',
       colVendor: '供应商',
       colPlatform: '平台',
@@ -648,8 +950,22 @@ export const translations: Record<Language, Translation> = {
       sourceLabel: '来源',
       sourceLocal: '本地报价库',
       sourceWeb: '网络搜索',
+      sourceSerpApi: 'SerpApi · Google Shopping',
+      sourceIdealo: 'Idealo 比价',
+      sourceMarketplaceApi: '商城 API',
+      priceVerification: '价格核验状态',
+      sourceLinks: '来源链接',
+      priceEvidence: '价格证据',
+      priceFromMarketplaceApi: '商城 API 价格',
+      priceFromSerpApi: 'SerpApi 商城价格',
+      priceExtracted: '商品页价格提取',
       webNeedsManualCheck: '需人工核价',
+      missingDelivery: '需核实交期',
+      missingPayment: '需核实付款方式',
+      missingDeliveryMethod: '需核实配送方式',
+      noMatches: '当前过滤条件没有匹配报价，请调整价格、交期或目标市场后重试。',
       allWebNotice: '本地报价库没有匹配结果，当前候选来自网络搜索；网络价格/交期可能需要人工核验。',
+      allMarketplaceApiNotice: '本地报价库没有匹配结果，当前价格来自已配置的商城 API；下单前请确认运费、税费和库存。',
       agentProgress: {
         eyebrow: '采购 Agent 思考中',
         runningTitle: '采购 Agent 正在进行标准品比价',
@@ -659,11 +975,16 @@ export const translations: Record<Language, Translation> = {
         thoughtLogLabel: 'Agent 思考流',
         emptyText: '正在等待后端 Agent 的第一条思考...',
         activeLabel: '正在实时工作，新步骤会自动出现',
+        messagesLabel: '消息',
+        searchesLabel: '搜索',
+        pagesLabel: '开页',
+        pricesLabel: '抽价',
       },
       paymentTerms: {
         onAccount: '挂帐',
         prepayment: '预付款',
         card: '信用卡 / PayPal',
+        unknown: '待确认',
       },
     },
     memory: {
@@ -724,6 +1045,44 @@ export const translations: Record<Language, Translation> = {
       name: '姓名',
       company: '公司',
       role: '角色',
+    },
+    supplierDirectory: {
+      title: '本地供应商资料库',
+      description: '维护已合作供应商、联系方式与历史表现标签。寻源时系统会优先考虑这些记录。',
+      addSupplier: '新增供应商',
+      editSupplier: '编辑供应商',
+      companyName: '公司名称',
+      country: '国家 / 地区',
+      city: '城市',
+      contact: '联系人',
+      email: '邮箱',
+      phone: '电话',
+      website: '网站',
+      capabilities: '产品能力 / 品类',
+      certifications: '认证或资质',
+      tags: '采购标签',
+      tagsHint: '用逗号分隔标签，例如：已合作供应商、历史表现良好。',
+      notes: '内部备注',
+      saveSupplier: '保存供应商',
+      updateSupplier: '更新供应商',
+      cancel: '取消',
+      deleteSupplier: '删除',
+      confirmDelete: '确定要删除这条本地供应商资料吗？此操作不可撤销。',
+      empty: '暂无本地供应商资料。添加已合作或可信赖的供应商后，未来搜索会优先考虑它们。',
+      localOnly: '本地资料',
+      created: '创建于',
+      updated: '更新于',
+      preferredTag: '已合作供应商',
+      reliableTag: '历史表现良好',
+      preferred: '在后续搜索中优先推荐该供应商',
+      performanceNote: '历史表现',
+      performancePlaceholder: '例如：准时交付 96%；2025 年质量评分 4.7/5',
+      minimumOrderQuantity: '最低订购量',
+      productionCapacity: '生产能力',
+      environmentalStandards: '环保标准',
+      saving: '保存中...',
+      loadError: '无法加载供应商资料库，已有本地记录不会丢失。',
+      saveError: '无法保存该供应商，请重试。',
     },
   },
 }

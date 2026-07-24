@@ -1,156 +1,81 @@
 import { useEffect, useState } from 'react'
 import type { Translation } from '../i18n'
-import type { Supplier, ConversationRecord, FeedbackRecord } from '../types'
+import type { Supplier, ConversationRecord, EvaluationCriterion, FeedbackRecord } from '../types'
 import { MOCK_SUPPLIERS } from '../data/suppliers'
-import { api, apiEnabled, type SourcingJob, type SourcingStructuredFields } from '../lib/api'
+import { api, apiEnabled, ApiError, type SourcingJob, type SourcingStructuredFields, withTimeout } from '../lib/api'
 import { useMemory } from '../context/MemoryContext'
 import { StepIndicator, ExportPrintToolbar, AnalyzeButton, RestoredBanner } from '../components/shared'
 import { FeedbackModal } from '../components/FeedbackModal'
 import { SearchIcon } from '../components/icons'
 import { AgentChatProgress } from '../components/AgentChatProgress'
+import { DEFAULT_SOURCING_CRITERIA, normalizeCriteria, SourcingCriteriaControl } from '../components/SourcingCriteriaControl'
+import { SupplierResultsTable } from '../components/SupplierResultsTable'
 
-function SupplierCard({
-  supplier,
-  t,
-  onSelect,
-}: {
-  supplier: Supplier
-  t: Translation
-  onSelect: () => void
-}) {
+function RecommendationBrief({ results, t }: { results: Supplier[]; t: Translation }) {
   const s = t.sourcing
-  // Defensive joins — real (scraped) data may be missing any of these fields.
-  const location = [supplier.city, supplier.country].filter(Boolean).join(', ')
-  const established = supplier.established ? ` · ${s.cardEstablished} ${supplier.established}` : ''
-  const contact = [supplier.contactPerson, supplier.phone].filter(Boolean).join(' · ')
-  const contactSub = [supplier.email, supplier.website].filter(Boolean).join(' · ')
-  const capabilities = supplier.capabilities ?? []
-  const certifications = supplier.certifications ?? []
-  const evidenceSnippets = supplier.evidenceSnippets ?? []
-  const sourceUrls = supplier.sourceUrls ?? []
+  const ranked = [...results].sort((a, b) => b.matchScore - a.matchScore)
+  const candidate = ranked[0]
+  const runnerUp = ranked[1]
+
+  if (!candidate) return null
+
+  const reasons = [
+    `${Math.round(candidate.matchScore)}% ${s.match}`,
+    candidate.weightedCriteriaScore == null ? null : `${s.criteriaTitle}: ${Math.round(candidate.weightedCriteriaScore)}%`,
+    isDatabaseSupplier(candidate) ? s.recommendationLocal : null,
+    candidate.productName || candidate.brand || candidate.model ? s.recommendationProduct : null,
+    (candidate.certifications?.length ?? 0) > 0 ? s.recommendationCertifications : null,
+    runnerUp && candidate.matchScore > runnerUp.matchScore
+      ? `${s.recommendationCompared}: ${Math.round(candidate.matchScore - runnerUp.matchScore)}%`
+      : null,
+  ].filter((reason): reason is string => Boolean(reason))
+
+  const hasContact = Boolean(candidate.email || candidate.phone || candidate.website)
+  const hasQuote = candidate.unitPrice != null || Boolean(candidate.quoteConditions)
+  const risks = [
+    !isDatabaseSupplier(candidate) ? s.recommendationWebRisk : null,
+    !hasContact ? s.recommendationContactRisk : null,
+    !hasQuote ? s.recommendationQuoteRisk : null,
+    !candidate.deliveryLeadTime ? s.recommendationDeliveryRisk : null,
+    !candidate.paymentTerms ? s.recommendationPaymentRisk : null,
+    candidate.verificationStatus && candidate.verificationStatus !== 'verified'
+      ? `${s.cardVerification}: ${candidate.verificationStatus}`
+      : null,
+  ].filter((risk): risk is string => Boolean(risk))
 
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm transition-shadow hover:shadow-md">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <h3 className="text-base font-semibold text-slate-900">{supplier.name}</h3>
-          {(location || established) && (
-            <p className="mt-0.5 text-sm text-slate-500">
-              {location}
-              {established}
-            </p>
-          )}
-        </div>
-        <div className="flex shrink-0 flex-col items-end gap-2">
-          <span
-            title={`${s.sourceLabel}: ${isDatabaseSupplier(supplier) ? s.localDatabaseTag : s.webSearchTag}`}
-            className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ring-inset ${
-              isDatabaseSupplier(supplier)
-                ? 'bg-amber-50 text-amber-700 ring-amber-600/20'
-                : 'bg-sky-50 text-sky-700 ring-sky-600/20'
-            }`}
-          >
-            {isDatabaseSupplier(supplier) ? s.localDatabaseTag : s.webSearchTag}
-          </span>
-          <span className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 ring-1 ring-inset ring-emerald-600/20">
-            {Math.round(supplier.matchScore)}% {s.match}
-          </span>
-        </div>
+    <section className="procurement-recommendation" aria-labelledby="sourcing-recommendation-title">
+      <div className="procurement-recommendation__lead">
+        <p className="procurement-recommendation__eyebrow">{s.recommendationTitle}</p>
+        <h3 id="sourcing-recommendation-title">{s.recommendationLead}: {candidate.name}</h3>
       </div>
-
-      <div className="mt-4 grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2">
-        <Field label={s.cardAddress} value={supplier.address || location} />
-        <Field label={s.cardContact} value={contact} sub={contactSub} />
-        <Field label={s.cardEmployees} value={supplier.employees} />
-        <Field label={s.cardRevenue} value={supplier.annualRevenue} />
+      <div className="procurement-recommendation__column">
+        <h4>{s.recommendationReasons}</h4>
+        <ul>
+          {reasons.map((reason) => <li key={reason}>{reason}</li>)}
+        </ul>
       </div>
-
-      {capabilities.length > 0 && (
-        <div className="mt-4 border-t border-slate-100 pt-4">
-          <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">{s.cardCapabilities}</p>
-          <div className="flex flex-wrap gap-1.5">
-            {capabilities.map((cap) => (
-              <span key={cap} className="rounded-md bg-blue-50 px-2 py-1 text-xs text-blue-700">
-                {cap}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {evidenceSnippets.length > 0 && (
-        <div className="mt-4 border-t border-slate-100 pt-4">
-          <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">{s.cardEvidence}</p>
-          <div className="space-y-1.5">
-            {evidenceSnippets.slice(0, 3).map((snippet, idx) => (
-              <p key={`${supplier.id}-evidence-${idx}`} className="rounded-lg bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600">
-                {snippet}
-              </p>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {sourceUrls.length > 0 && (
-        <div className="mt-4 border-t border-slate-100 pt-4">
-          <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">{s.cardSources}</p>
-          <div className="flex flex-wrap gap-1.5">
-            {sourceUrls.slice(0, 4).map((url) => (
-              <a
-                key={url}
-                href={url}
-                target="_blank"
-                rel="noreferrer"
-                className="max-w-full truncate rounded-md border border-blue-100 bg-blue-50 px-2 py-1 text-xs text-blue-700 hover:bg-blue-100"
-              >
-                {url.replace(/^https?:\/\//, '').replace(/\/$/, '')}
-              </a>
-            ))}
-          </div>
-        </div>
-      )}
-
-      <div className="mt-3 flex flex-wrap items-end justify-between gap-3">
-        <div>
-          {certifications.length > 0 && (
-            <>
-              <p className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-slate-400">{s.cardCerts}</p>
-              <div className="flex flex-wrap gap-1.5">
-                {certifications.map((cert) => (
-                  <span key={cert} className="rounded-md border border-slate-200 px-2 py-0.5 text-xs text-slate-600">
-                    {cert}
-                  </span>
-                ))}
-              </div>
-            </>
-          )}
-        </div>
-        <button
-          type="button"
-          onClick={onSelect}
-          className="rounded-lg border border-blue-200 bg-white px-4 py-2 text-sm font-medium text-blue-600 transition-colors hover:bg-blue-50 print:hidden"
-        >
-          {t.common.giveFeedback}
-        </button>
+      <div className="procurement-recommendation__column procurement-recommendation__column--risk">
+        <h4>{s.recommendationRisks}</h4>
+        {risks.length > 0 ? (
+          <ul>{risks.map((risk) => <li key={risk}>{risk}</li>)}</ul>
+        ) : (
+          <p>{s.recommendationNoRisk}</p>
+        )}
       </div>
-    </div>
-  )
-}
-
-function Field({ label, value, sub }: { label: string; value?: string; sub?: string }) {
-  return (
-    <div className="min-w-0">
-      <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">{label}</p>
-      <p className="mt-0.5 text-sm text-slate-700">{value || '—'}</p>
-      {sub && <p className="text-xs text-slate-400">{sub}</p>}
-    </div>
+    </section>
   )
 }
 
 type SearchStatus = 'idle' | 'running' | 'success' | 'empty' | 'error'
 
+const JOB_TIMEOUT_MS = 120_000
+const JOB_POLL_INTERVAL_MS = 1_500
+
 function isDatabaseSupplier(supplier: Supplier): boolean {
-  return supplier.source !== 'web'
+  const source = supplier.source?.trim().toLowerCase()
+  // Offline demo rows have no source metadata; treat them as curated local data.
+  return !source || source === 'database' || source === 'local' || source === 'db'
 }
 
 export function SourcingModule({
@@ -207,6 +132,7 @@ export function SourcingModule({
   )
   const [searchJob, setSearchJob] = useState<SourcingJob | null>(null)
   const [searchError, setSearchError] = useState(false)
+  const [errorDetail, setErrorDetail] = useState<string | null>(null)
   const [feedbackFor, setFeedbackFor] = useState<string | null>(null)
   const [activeConversationId, setActiveConversationId] = useState<string | null>(
     restore?.id ?? null
@@ -217,18 +143,29 @@ export function SourcingModule({
   const [structProductName, setStructProductName] = useState(savedRestore?.productName ?? '')
   const [structQuantity, setStructQuantity] = useState(savedRestore?.quantity ?? '')
   const [structBrand, setStructBrand] = useState(savedRestore?.brand ?? '')
+  const [structModel, setStructModel] = useState(savedRestore?.model ?? '')
+  const [structSpecifications, setStructSpecifications] = useState(savedRestore?.specifications ?? '')
+  const [structStandards, setStructStandards] = useState(savedRestore?.standards ?? '')
   const [structCategory, setStructCategory] = useState(savedRestore?.structuredCategory ?? '')
   const [structCountry, setStructCountry] = useState(savedRestore?.structuredCountry ?? '')
   const [structCerts, setStructCerts] = useState(savedRestore?.structuredCerts ?? '')
+  const [criteria, setCriteria] = useState<EvaluationCriterion[]>(() =>
+    savedRestore?.sourcingCriteria?.length
+      ? normalizeCriteria(savedRestore.sourcingCriteria)
+      : DEFAULT_SOURCING_CRITERIA,
+  )
 
   /** Append structured info to the NL query for backward compat / mock mode. */
   const buildEnhancedQuery = () => {
-    if (!structProductName && !structQuantity && !structBrand && !structCategory && !structCountry && !structCerts)
+    if (!structProductName && !structQuantity && !structBrand && !structModel && !structSpecifications && !structStandards && !structCategory && !structCountry && !structCerts)
       return query
     const parts: string[] = []
     if (structProductName) parts.push(`Product: ${structProductName}`)
     if (structQuantity) parts.push(`Quantity: ${structQuantity}`)
     if (structBrand) parts.push(`Brand: ${structBrand}`)
+    if (structModel) parts.push(`Model: ${structModel}`)
+    if (structSpecifications) parts.push(`Specifications: ${structSpecifications}`)
+    if (structStandards) parts.push(`Standards: ${structStandards}`)
     if (structCategory) parts.push(`Category: ${structCategory}`)
     if (structCountry) parts.push(`Target Country: ${structCountry}`)
     if (structCerts) parts.push(`Certifications: ${structCerts}`)
@@ -240,11 +177,34 @@ export function SourcingModule({
       productName: structProductName || undefined,
       quantity: structQuantity || undefined,
       brand: structBrand || undefined,
+      model: structModel || undefined,
+      specifications: structSpecifications || undefined,
+      standards: structStandards || undefined,
       category: structCategory || undefined,
       country: structCountry || undefined,
+      targetRegion: structCountry || undefined,
       certifications: structCerts || undefined,
     }
     return Object.values(structured).some(Boolean) ? structured : undefined
+  }
+
+  /**
+   * Let the agent make the natural-language input reviewable instead of opaque.
+   * Existing manual values always win, so a late parser response cannot overwrite
+   * a buyer's correction.
+   */
+  const applyParsedIntent = (intent?: Record<string, unknown> | null) => {
+    if (!intent) return
+    const category = typeof intent.category === 'string' ? intent.category : ''
+    const country = typeof intent.country === 'string' ? intent.country : ''
+    const certifications = Array.isArray(intent.certifications)
+      ? intent.certifications.filter((value): value is string => typeof value === 'string').join(', ')
+      : ''
+    const categoryIsVisible = Boolean(category && Object.hasOwn(t.sourcing.categories, category))
+
+    if (categoryIsVisible && !structCategory) setStructCategory(category)
+    if (country && !structCountry) setStructCountry(country)
+    if (certifications && !structCerts) setStructCerts(certifications)
   }
 
   /** Human-readable filter summary for the memory card. */
@@ -254,9 +214,13 @@ export function SourcingModule({
     add(t.sourcing.productName, structProductName)
     add(t.sourcing.quantity, structQuantity)
     add(t.sourcing.brand, structBrand)
+    add(t.sourcing.model, structModel)
+    add(t.sourcing.specifications, structSpecifications)
+    add(t.sourcing.standards, structStandards)
     add(t.sourcing.structuredCategory, structCategory)
     add(t.sourcing.structuredCountry, structCountry)
     add(t.sourcing.structuredCerts, structCerts)
+    if (criteria.length > 0) add(t.sourcing.criteriaTitle, criteria.map((criterion) => `${criterion.label} ${criterion.weight}%`).join(' · '))
     return s
   }
 
@@ -273,11 +237,15 @@ export function SourcingModule({
         productName: structProductName || undefined,
         quantity: structQuantity || undefined,
         brand: structBrand || undefined,
+        model: structModel || undefined,
+        specifications: structSpecifications || undefined,
+        standards: structStandards || undefined,
         structuredCategory: structCategory || undefined,
         structuredCountry: structCountry || undefined,
         structuredCerts: structCerts || undefined,
+        sourcingCriteria: criteria,
       },
-      requestSnapshot: { query, enhancedQuery, structured: structured ?? null },
+      requestSnapshot: { query, enhancedQuery, structured: structured ?? null, criteria },
       resultCount: list.length,
       candidateNames: list.map((r) => r.name),
       resultsSnapshot: list as unknown as Record<string, unknown>[],
@@ -285,9 +253,12 @@ export function SourcingModule({
   }
 
   const pollSearchJob = async (jobId: string): Promise<SourcingJob> => {
+    const deadline = Date.now() + JOB_TIMEOUT_MS
     for (;;) {
-      await new Promise((resolve) => setTimeout(resolve, 1500))
-      const job = await api.sourcing.getJob(jobId)
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) throw new ApiError(t.common.searchTimeout, 'TIMEOUT', 408)
+      await new Promise((resolve) => setTimeout(resolve, Math.min(JOB_POLL_INTERVAL_MS, remaining)))
+      const job = await withTimeout(api.sourcing.getJob(jobId), Math.max(1, deadline - Date.now()), t.common.searchTimeout)
       setSearchJob(job)
 
       if (job.progress >= 35 && job.progress < 75) setCurrentStep(2)
@@ -305,6 +276,7 @@ export function SourcingModule({
     setSearchStatus('running')
     setSearchJob(null)
     setSearchError(false)
+    setErrorDetail(null)
     setResults([])
     setCurrentStep(1)
 
@@ -314,39 +286,54 @@ export function SourcingModule({
         try {
           // Preferred path: async job with live "Agent Thinking" progress (SSE).
           // Send both enhanced text and structured fields; older backends ignore unknown structured payloads.
-          const created = await api.sourcing.createJob(enhancedQuery, structured)
+          const created = await withTimeout(
+            api.sourcing.createJob(enhancedQuery, structured, criteria),
+            JOB_TIMEOUT_MS,
+            t.common.searchTimeout,
+          )
           setSearchJob(created)
+          applyParsedIntent(created.intent)
           console.log(`[SourcingModule] Job created:`, created.jobId)
           let finished: SourcingJob
           try {
-            finished = await api.sourcing.streamJob(created.jobId, (job) => {
-              setSearchJob(job)
-              if (job.progress >= 35 && job.progress < 75) setCurrentStep(2)
-              if (job.progress >= 75) setCurrentStep(3)
-            })
-          } catch {
+            finished = await withTimeout(
+              api.sourcing.streamJob(created.jobId, (job) => {
+                setSearchJob(job)
+                if (job.progress >= 35 && job.progress < 75) setCurrentStep(2)
+                if (job.progress >= 75) setCurrentStep(3)
+              }),
+              JOB_TIMEOUT_MS,
+              t.common.searchTimeout,
+            )
+          } catch (streamError) {
+            if (streamError instanceof ApiError && streamError.code === 'TIMEOUT') throw streamError
             // Some deployment proxies buffer or close long-lived streams. Keep the
             // stable polling path as a fallback so the UX still progresses.
             finished = await pollSearchJob(created.jobId)
           }
           console.log(`[SourcingModule] Job finished:`, { status: finished.status, results: finished.results?.length })
+          applyParsedIntent(finished.intent)
           list = finished.results ?? []
           if (finished.status === 'failed') {
-            setResults(list)
             setSearchError(true)
+            setErrorDetail(finished.error ?? null)
             setSearchStatus('error')
           } else {
             setResults(list)
             setSearchStatus(list.length > 0 ? 'success' : 'empty')
+            setCurrentStep(3)
           }
-        } catch {
+        } catch (jobError) {
+          if (jobError instanceof ApiError && jobError.code === 'TIMEOUT') throw jobError
           // Backend has no job endpoints yet (older deploy → 404). Fall back to the
           // plain synchronous search so results still load (without live progress).
           setSearchJob(null)
-          const res = await api.sourcing.search(enhancedQuery, structured)
+          const res = await api.sourcing.search(enhancedQuery, structured, criteria)
+          applyParsedIntent(res.intent)
           list = res.results ?? []
           setResults(list)
           setSearchStatus(list.length > 0 ? 'success' : 'empty')
+          setCurrentStep(3)
         }
       } else {
         // Keep the step animation visible in mock mode.
@@ -354,6 +341,7 @@ export function SourcingModule({
         list = MOCK_SUPPLIERS
         setResults(list)
         setSearchStatus('success')
+        setCurrentStep(3)
       }
       setHasRun(true)
       console.log(`[SourcingModule] Results set, saving to memory...`, { resultCount: list.length })
@@ -369,12 +357,13 @@ export function SourcingModule({
       console.log(`[SourcingModule] handleAnalyze SUCCESS, hasRun=true`)
     } catch (e) {
       console.error(`[SourcingModule] handleAnalyze CATCH:`, e)
+      setErrorDetail(e instanceof Error ? e.message : String(e))
       setSearchError(true)
       setSearchStatus('error')
       setHasRun(true)
+      setSearchJob(null)
     } finally {
       setIsAnalyzing(false)
-      setCurrentStep(3)
     }
   }
 
@@ -386,69 +375,105 @@ export function SourcingModule({
   }
 
   return (
-    <div className="space-y-8">
-      <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm print:hidden">
-        <label className="mb-2 block text-sm font-medium text-slate-700">{t.sourcing.inputLabel}</label>
+    <div className="sourcing-module space-y-8">
+      <section className="procurement-panel procurement-panel--emphasis p-6 print:hidden">
+        <label className="procurement-label mb-2 block">{t.sourcing.inputLabel}</label>
         <textarea
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           rows={3}
           placeholder={t.sourcing.placeholder}
-          className="w-full resize-none rounded-lg border border-slate-200 bg-slate-50/50 px-4 py-3 text-sm text-slate-800 placeholder:text-slate-400 transition-colors focus:border-blue-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+          className="procurement-input w-full resize-none border px-4 py-3 text-sm focus:outline-none"
         />
-        <p className="mt-1.5 text-xs text-slate-400">{t.sourcing.hint}</p>
+        <p className="procurement-helper mt-1.5 text-xs">{t.sourcing.hint}</p>
 
         {/* ── Structured form (双模输入) ───────────────────────────────── */}
-        <div className="mt-6 border-t border-slate-200 pt-6">
-          <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+        <div className="procurement-structured mt-6 border-t pt-6">
+          <p className="procurement-structured__title">
             {t.sourcing.structuredLabel}
           </p>
-          <p className="mb-4 mt-0.5 text-xs text-slate-400">{t.sourcing.structuredHint}</p>
+          <p className="procurement-structured-hint mb-4 mt-0.5 text-xs">{t.sourcing.structuredHint}</p>
 
           <div className="grid grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2 lg:grid-cols-3">
             {/* Product Name */}
-            <div>
-              <label className="mb-1.5 block text-sm font-medium text-slate-700">{t.sourcing.productName}</label>
+            <div className="procurement-field">
+              <label className="procurement-label mb-1.5 block">{t.sourcing.productName}</label>
               <input
                 type="text"
                 value={structProductName}
                 onChange={(e) => setStructProductName(e.target.value)}
                 placeholder={t.sourcing.productNamePlaceholder}
-                className="w-full rounded-lg border border-slate-200 bg-slate-50/50 px-3 py-2 text-sm text-slate-700 placeholder:text-slate-400 transition-colors focus:border-blue-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                className="procurement-input w-full border px-3 py-2 text-sm focus:outline-none"
               />
             </div>
 
             {/* Quantity */}
-            <div>
-              <label className="mb-1.5 block text-sm font-medium text-slate-700">{t.sourcing.quantity}</label>
+            <div className="procurement-field">
+              <label className="procurement-label mb-1.5 block">{t.sourcing.quantity}</label>
               <input
                 type="text"
                 value={structQuantity}
                 onChange={(e) => setStructQuantity(e.target.value)}
                 placeholder={t.sourcing.quantityPlaceholder}
-                className="w-full rounded-lg border border-slate-200 bg-slate-50/50 px-3 py-2 text-sm text-slate-700 placeholder:text-slate-400 transition-colors focus:border-blue-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                className="procurement-input w-full border px-3 py-2 text-sm focus:outline-none"
               />
             </div>
 
             {/* Brand */}
-            <div>
-              <label className="mb-1.5 block text-sm font-medium text-slate-700">{t.sourcing.brand}</label>
+            <div className="procurement-field">
+              <label className="procurement-label mb-1.5 block">{t.sourcing.brand}</label>
               <input
                 type="text"
                 value={structBrand}
                 onChange={(e) => setStructBrand(e.target.value)}
                 placeholder={t.sourcing.brandPlaceholder}
-                className="w-full rounded-lg border border-slate-200 bg-slate-50/50 px-3 py-2 text-sm text-slate-700 placeholder:text-slate-400 transition-colors focus:border-blue-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                className="procurement-input w-full border px-3 py-2 text-sm focus:outline-none"
+              />
+            </div>
+
+            {/* Model */}
+            <div className="procurement-field">
+              <label className="procurement-label mb-1.5 block">{t.sourcing.model}</label>
+              <input
+                type="text"
+                value={structModel}
+                onChange={(e) => setStructModel(e.target.value)}
+                placeholder={t.sourcing.modelPlaceholder}
+                className="procurement-input w-full border px-3 py-2 text-sm focus:outline-none"
+              />
+            </div>
+
+            {/* Specifications */}
+            <div className="procurement-field">
+              <label className="procurement-label mb-1.5 block">{t.sourcing.specifications}</label>
+              <input
+                type="text"
+                value={structSpecifications}
+                onChange={(e) => setStructSpecifications(e.target.value)}
+                placeholder={t.sourcing.specificationsPlaceholder}
+                className="procurement-input w-full border px-3 py-2 text-sm focus:outline-none"
+              />
+            </div>
+
+            {/* Standards */}
+            <div className="procurement-field">
+              <label className="procurement-label mb-1.5 block">{t.sourcing.standards}</label>
+              <input
+                type="text"
+                value={structStandards}
+                onChange={(e) => setStructStandards(e.target.value)}
+                placeholder={t.sourcing.standardsPlaceholder}
+                className="procurement-input w-full border px-3 py-2 text-sm focus:outline-none"
               />
             </div>
 
             {/* Category */}
-            <div>
-              <label className="mb-1.5 block text-sm font-medium text-slate-700">{t.sourcing.structuredCategory}</label>
+            <div className="procurement-field">
+              <label className="procurement-label mb-1.5 block">{t.sourcing.structuredCategory}</label>
               <select
                 value={structCategory}
                 onChange={(e) => setStructCategory(e.target.value)}
-                className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                className="procurement-input w-full border px-3 py-2 text-sm focus:outline-none"
               >
                 <option value="">{t.sourcing.categoryAll}</option>
                 {Object.entries(t.sourcing.categories).map(([key, label]) => (
@@ -458,29 +483,31 @@ export function SourcingModule({
             </div>
 
             {/* Country */}
-            <div>
-              <label className="mb-1.5 block text-sm font-medium text-slate-700">{t.sourcing.structuredCountry}</label>
+            <div className="procurement-field">
+              <label className="procurement-label mb-1.5 block">{t.sourcing.structuredCountry}</label>
               <input
                 type="text"
                 value={structCountry}
                 onChange={(e) => setStructCountry(e.target.value)}
                 placeholder={t.sourcing.countryPlaceholder}
-                className="w-full rounded-lg border border-slate-200 bg-slate-50/50 px-3 py-2 text-sm text-slate-700 placeholder:text-slate-400 transition-colors focus:border-blue-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                className="procurement-input w-full border px-3 py-2 text-sm focus:outline-none"
               />
             </div>
 
             {/* Certifications */}
-            <div>
-              <label className="mb-1.5 block text-sm font-medium text-slate-700">{t.sourcing.structuredCerts}</label>
+            <div className="procurement-field">
+              <label className="procurement-label mb-1.5 block">{t.sourcing.structuredCerts}</label>
               <input
                 type="text"
                 value={structCerts}
                 onChange={(e) => setStructCerts(e.target.value)}
                 placeholder={t.sourcing.certsPlaceholder}
-                className="w-full rounded-lg border border-slate-200 bg-slate-50/50 px-3 py-2 text-sm text-slate-700 placeholder:text-slate-400 transition-colors focus:border-blue-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                className="procurement-input w-full border px-3 py-2 text-sm focus:outline-none"
               />
             </div>
           </div>
+
+          <SourcingCriteriaControl criteria={criteria} onChange={setCriteria} t={t} />
         </div>
         {/* ── End structured form ────────────────────────────────────────── */}
 
@@ -489,23 +516,25 @@ export function SourcingModule({
         </div>
       </section>
 
-      <section className="rounded-xl border border-slate-200 bg-white px-8 py-6 shadow-sm print:hidden">
+      <section className="procurement-panel procurement-steps-panel px-8 py-6 print:hidden">
         <StepIndicator currentStep={currentStep} steps={t.steps} />
       </section>
 
       {searchJob && searchStatus !== 'idle' && <AgentChatProgress key={searchJob.jobId} job={searchJob} copy={t.sourcing.agentProgress} />}
 
       {hasRun && (
-        <section className="space-y-4">
+        <section className="sourcing-results space-y-4">
           {savedResults && <RestoredBanner t={t} />}
-          <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="sourcing-results__header flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-3">
-              <h2 className="text-base font-semibold text-slate-900">
+              <h2 className="procurement-results-title font-semibold">
                 {t.common.resultsFound(results.length)}
               </h2>
-              <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-medium text-emerald-700 ring-1 ring-emerald-600/20 print:hidden">
-                {t.common.analysisComplete}
-              </span>
+              {!searchError && (
+                <span className="procurement-complete-badge px-3 py-1 text-xs font-medium print:hidden">
+                  {t.common.analysisComplete}
+                </span>
+              )}
             </div>
             <ExportPrintToolbar
               t={t}
@@ -523,7 +552,19 @@ export function SourcingModule({
                 t.sourcing.cardRevenue,
                 t.sourcing.cardCapabilities,
                 t.sourcing.cardCerts,
+                t.sourcing.colProduct,
+                t.sourcing.colBrand,
+                t.sourcing.colModel,
+                t.sourcing.colSpecifications,
+                t.sourcing.colStandards,
+                t.sourcing.colUnitPrice,
+                t.sourcing.colQuoteConditions,
+                t.sourcing.colLeadTime,
+                t.sourcing.colPaymentTerms,
+                t.sourcing.cardVerification,
                 t.sourcing.sourceLabel,
+                t.sourcing.colSources,
+                t.sourcing.cardEvidence,
                 t.sourcing.match,
               ]}
               rows={results.map((r) => [
@@ -538,22 +579,47 @@ export function SourcingModule({
                 r.annualRevenue ?? '',
                 (r.capabilities ?? []).join('; '),
                 (r.certifications ?? []).join('; '),
+                r.productName ?? '',
+                r.brand ?? '',
+                r.model ?? '',
+                r.specifications ?? '',
+                (r.standards ?? []).join('; '),
+                r.unitPrice == null ? '' : `${r.currency ?? 'EUR'} ${r.unitPrice}`,
+                r.quoteConditions ?? '',
+                r.deliveryLeadTime ?? '',
+                r.paymentTerms ?? '',
+                r.verificationStatus ?? '',
                 isDatabaseSupplier(r) ? t.sourcing.localDatabaseTag : t.sourcing.webSearchTag,
+                (r.sourceUrls ?? []).join('; '),
+                (r.evidenceSnippets ?? []).join(' | '),
                 `${Math.round(r.matchScore)}%`,
               ])}
             />
           </div>
 
           {!searchError && hasOnlyWebResults && (
-            <div className="rounded-xl border border-amber-200 bg-amber-50 px-5 py-3 text-sm font-medium text-amber-800 shadow-sm print:hidden">
+            <div className="procurement-notice border px-5 py-3 text-sm font-medium print:hidden">
               {t.sourcing.allWebNotice}
             </div>
           )}
 
+          {!searchError && results.length > 0 && (
+            <RecommendationBrief results={results} t={t} />
+          )}
+
           {searchError ? (
-            <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-red-200 bg-red-50 p-12 text-red-500">
+            <div role="alert" className="flex flex-col items-center justify-center rounded-xl border border-dashed border-red-200 bg-red-50 p-12 text-red-500">
               <SearchIcon className="mb-3 h-7 w-7" />
               <p className="text-sm">{t.common.searchError}</p>
+              {errorDetail && <p className="mt-2 max-w-2xl text-center text-xs text-red-600">{errorDetail}</p>}
+              <button
+                type="button"
+                onClick={() => void handleAnalyze()}
+                disabled={isAnalyzing}
+                className="procurement-primary-action mt-5 inline-flex items-center px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                {t.common.analyze}
+              </button>
             </div>
           ) : results.length === 0 ? (
             <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white p-12 text-slate-400">
@@ -561,16 +627,12 @@ export function SourcingModule({
               <p className="text-sm">{t.common.empty}</p>
             </div>
           ) : (
-            <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-              {results.map((supplier) => (
-                <SupplierCard
-                  key={supplier.id}
-                  supplier={supplier}
-                  t={t}
-                  onSelect={() => setFeedbackFor(supplier.name)}
-                />
-              ))}
-            </div>
+            <SupplierResultsTable
+              key={results.map((supplier) => supplier.id).join('|')}
+              suppliers={results}
+              t={t}
+              onSelect={setFeedbackFor}
+            />
           )}
         </section>
       )}

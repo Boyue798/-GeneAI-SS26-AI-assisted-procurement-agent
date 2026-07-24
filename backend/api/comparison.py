@@ -6,7 +6,6 @@ Optimization over the original:
     requires a valid Bearer token, matching the openapi.yaml contract.
   - Added asynchronous comparison jobs so long-running Agent analysis can expose
     real progress to the frontend, mirroring the supplier sourcing module.
-  - Auto-saves search results to Supabase (quotes, products, suppliers).
 """
 
 from __future__ import annotations
@@ -21,43 +20,60 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from api.agent_compat import supported_kwargs
 from api.auth import AuthUser, get_current_user
 from db_writer import save_comparison_request_and_quotes
-
 
 router = APIRouter(prefix="/api/comparison", tags=["comparison"])
 
 
+class FactorWeights(BaseModel):
+    price: int = 40
+    delivery: int = 35
+    rating: int = 25
+
+
+class EvaluationCriterion(BaseModel):
+    """Optional user-defined quote comparison dimension."""
+
+    key: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_-]*$")
+    label: Optional[str] = Field(default=None, max_length=120)
+    weight: float = Field(ge=0, le=100)
+
+
 class ComparisonSearchRequest(BaseModel):
     query: str = Field(min_length=1)
+    country: Optional[str] = Field(default=None, max_length=80)
     minPrice: Optional[float] = None
     maxPrice: Optional[float] = None
     deliveryTime: Optional[str] = None
+    weights: Optional[FactorWeights] = None
+    criteria: list[EvaluationCriterion] = Field(default_factory=list, max_length=12)
 
 
-class SearchJobEvent(BaseModel):
+class ComparisonJobEvent(BaseModel):
     timestamp: int
     phase: str
     message: str
     progress: int
 
 
-class SearchJobResponse(BaseModel):
+class ComparisonJobResponse(BaseModel):
     jobId: str
     status: Literal["queued", "running", "completed", "failed"]
     progress: int
     step: str
-    events: list[SearchJobEvent]
+    events: list[ComparisonJobEvent]
     intent: dict | None = None
     results: list[dict] = Field(default_factory=list)
     error: str | None = None
 
 
-class _SearchJobState(SearchJobResponse):
+class _ComparisonJobState(ComparisonJobResponse):
     owner: str
 
 
-_SEARCH_JOBS: dict[str, _SearchJobState] = {}
+_COMPARISON_JOBS: dict[str, _ComparisonJobState] = {}
 _MAX_JOBS = 100
 
 
@@ -65,16 +81,16 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _public_job(job: _SearchJobState) -> SearchJobResponse:
-    return SearchJobResponse(**job.model_dump(exclude={"owner"}))
+def _public_job(job: _ComparisonJobState) -> ComparisonJobResponse:
+    return ComparisonJobResponse(**job.model_dump(exclude={"owner"}))
 
 
-def _append_event(job: _SearchJobState, phase: str, message: str, progress: int) -> None:
+def _append_event(job: _ComparisonJobState, phase: str, message: str, progress: int) -> None:
     progress = max(0, min(100, int(progress)))
     job.progress = max(job.progress, progress)
     job.step = message
     job.events.append(
-        SearchJobEvent(
+        ComparisonJobEvent(
             timestamp=_now_ms(),
             phase=phase,
             message=message,
@@ -84,75 +100,45 @@ def _append_event(job: _SearchJobState, phase: str, message: str, progress: int)
 
 
 def _prune_jobs() -> None:
-    if len(_SEARCH_JOBS) <= _MAX_JOBS:
+    if len(_COMPARISON_JOBS) <= _MAX_JOBS:
         return
     oldest = sorted(
-        _SEARCH_JOBS.items(),
+        _COMPARISON_JOBS.items(),
         key=lambda item: item[1].events[0].timestamp if item[1].events else 0,
     )
-    for job_id, _ in oldest[: len(_SEARCH_JOBS) - _MAX_JOBS]:
-        _SEARCH_JOBS.pop(job_id, None)
+    for job_id, _ in oldest[: len(_COMPARISON_JOBS) - _MAX_JOBS]:
+        _COMPARISON_JOBS.pop(job_id, None)
 
 
-def _format_sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-
-async def _stream_job_events(job_id: str, owner: str) -> AsyncIterator[str]:
-    last_event_count = -1
-    last_status: str | None = None
-    while True:
-        job = _SEARCH_JOBS.get(job_id)
-        if job is None or job.owner != owner:
-            yield _format_sse("error", {"code": "NOT_FOUND", "message": "Comparison job not found"})
-            return
-        event_count = len(job.events)
-        if event_count != last_event_count or job.status != last_status:
-            yield _format_sse("job", _public_job(job).model_dump())
-            last_event_count = event_count
-            last_status = job.status
-        if job.status in {"completed", "failed"}:
-            yield _format_sse("done", _public_job(job).model_dump())
-            return
-        await asyncio.sleep(1)
-
-
-async def _run_comparison_job(
-    job_id: str,
-    req: ComparisonSearchRequest,
-    agent: object,
-) -> None:
-    job = _SEARCH_JOBS[job_id]
+async def _run_comparison_job(job_id: str, req: ComparisonSearchRequest, agent: object) -> None:
+    job = _COMPARISON_JOBS[job_id]
     job.status = "running"
-    _append_event(job, "queued", "已接收比价任务，Agent 正在启动分析流程...", 5)
-
-    # 立刻记录这次请求
-    try:
-        save_comparison_request_and_quotes(
-            request_text=req.query,
-            requested_by=job.owner,
-            items=[],
-        )
-    except Exception as e:
-        print(f"[comparison] 保存请求失败: {e}")
+    _append_event(job, "queued", "已接收标准品比价任务，Agent 正在启动采购报价分析流程...", 5)
 
     def progress(phase: str, message: str, percent: int) -> None:
         _append_event(job, phase, message, percent)
 
     try:
-        result = await agent.search_quotes(  # type: ignore[attr-defined]
+        agent_method = agent.search_quotes  # type: ignore[attr-defined]
+        result = await agent_method(
             req.query,
-            min_price=req.minPrice,
-            max_price=req.maxPrice,
-            delivery_time=req.deliveryTime,
-            progress=progress,
+            **supported_kwargs(
+                agent_method,
+                {
+                    "min_price": req.minPrice,
+                    "max_price": req.maxPrice,
+                    "delivery_time": req.deliveryTime,
+                    "weights": req.weights.model_dump() if req.weights else None,
+                    "criteria": [criterion.model_dump() for criterion in req.criteria],
+                    "progress": progress,
+                    "country": req.country,
+                },
+            ),
         )
         job.intent = result.get("intent")
         job.results = result.get("results", [])
         job.status = "completed"
-        _append_event(job, "completed", "比价分析完成，结果已准备就绪。", 100)
-
-        # 保存搜索结果到数据库
+        _append_event(job, "completed", "标准品比价表已准备就绪，可以查看推荐结果了。", 100)
         try:
             save_comparison_request_and_quotes(
                 request_text=req.query,
@@ -160,12 +146,41 @@ async def _run_comparison_job(
                 items=job.results,
             )
         except Exception as e:
-            print(f"[comparison] 保存结果失败，不影响返回: {e}")
-
-    except Exception as exc:
+            print(f"[comparison] 保存数据库失败，不影响返回结果: {e}")
+    except Exception as exc:  # pragma: no cover - exact production errors vary
         job.status = "failed"
         job.error = str(exc)
-        _append_event(job, "failed", f"比价过程遇到问题：{exc}。请尝试调整需求后重试。", max(job.progress, 5))
+        _append_event(job, "failed", f"比价分析遇到了问题：{exc}。请尝试调整需求描述或过滤条件后重试。", max(job.progress, 5))
+
+
+def reset_comparison_jobs_for_tests() -> None:
+    _COMPARISON_JOBS.clear()
+
+
+def _format_sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+async def _stream_comparison_job_events(job_id: str, owner: str) -> AsyncIterator[str]:
+    last_event_count = -1
+    last_status: str | None = None
+    while True:
+        job = _COMPARISON_JOBS.get(job_id)
+        if job is None or job.owner != owner:
+            yield _format_sse("error", {"code": "NOT_FOUND", "message": "Comparison job not found"})
+            return
+
+        event_count = len(job.events)
+        if event_count != last_event_count or job.status != last_status:
+            yield _format_sse("job", _public_job(job).model_dump())
+            last_event_count = event_count
+            last_status = job.status
+
+        if job.status in {"completed", "failed"}:
+            yield _format_sse("done", _public_job(job).model_dump())
+            return
+
+        await asyncio.sleep(1)
 
 
 @router.post("/search")
@@ -175,16 +190,25 @@ async def search(
     current_user: Annotated[AuthUser, Depends(get_current_user)],
 ):
     """
-    POST /api/comparison/search — synchronous fallback.
-    Protected: requires Authorization: Bearer <token> header.
-    """
-    result = await request.app.state.agent.search_quotes(
-        req.query,
-        min_price=req.minPrice,
-        max_price=req.maxPrice,
-        delivery_time=req.deliveryTime,
-    )
+    POST /api/comparison/search — match openapi.yaml spec.
 
+    Protected: requires Authorization: Bearer header.
+    """
+    agent_method = request.app.state.agent.search_quotes
+    result = await agent_method(
+        req.query,
+        **supported_kwargs(
+            agent_method,
+            {
+                "min_price": req.minPrice,
+                "max_price": req.maxPrice,
+                "delivery_time": req.deliveryTime,
+                "weights": req.weights.model_dump() if req.weights else None,
+                "criteria": [criterion.model_dump() for criterion in req.criteria],
+                "country": req.country,
+            },
+        ),
+    )
     try:
         save_comparison_request_and_quotes(
             request_text=req.query,
@@ -193,20 +217,19 @@ async def search(
         )
     except Exception as e:
         print(f"[comparison] 保存数据库失败，不影响返回结果: {e}")
-
     return result
 
 
-@router.post("/search-jobs", response_model=SearchJobResponse, status_code=status.HTTP_202_ACCEPTED)
-async def create_search_job(
+@router.post("/search-jobs", response_model=ComparisonJobResponse, status_code=status.HTTP_202_ACCEPTED)
+async def create_comparison_job(
     req: ComparisonSearchRequest,
     request: Request,
     current_user: Annotated[AuthUser, Depends(get_current_user)],
-) -> SearchJobResponse:
-    """Create an asynchronous comparison job and return immediately."""
+) -> ComparisonJobResponse:
+    """Create an asynchronous quote-comparison job and return immediately."""
     _prune_jobs()
     job_id = uuid4().hex
-    job = _SearchJobState(
+    job = _ComparisonJobState(
         jobId=job_id,
         owner=current_user.email,
         status="queued",
@@ -217,19 +240,18 @@ async def create_search_job(
         results=[],
         error=None,
     )
-    _append_event(job, "queued", "Queued comparison job", 0)
-    _SEARCH_JOBS[job_id] = job
+    _append_event(job, "queued", "Queued quote comparison job", 0)
+    _COMPARISON_JOBS[job_id] = job
     asyncio.create_task(_run_comparison_job(job_id, req, request.app.state.agent))
     return _public_job(job)
 
 
-@router.get("/search-jobs/{job_id}", response_model=SearchJobResponse)
-async def get_search_job(
+@router.get("/search-jobs/{job_id}", response_model=ComparisonJobResponse)
+async def get_comparison_job(
     job_id: str,
     current_user: Annotated[AuthUser, Depends(get_current_user)],
-) -> SearchJobResponse:
-    """Poll a comparison job created by POST /search-jobs."""
-    job = _SEARCH_JOBS.get(job_id)
+) -> ComparisonJobResponse:
+    job = _COMPARISON_JOBS.get(job_id)
     if job is None or job.owner != current_user.email:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -239,19 +261,18 @@ async def get_search_job(
 
 
 @router.get("/search-jobs/{job_id}/events")
-async def stream_search_job_events(
+async def stream_comparison_job_events(
     job_id: str,
     current_user: Annotated[AuthUser, Depends(get_current_user)],
 ) -> StreamingResponse:
-    """Stream comparison job progress as SSE."""
-    job = _SEARCH_JOBS.get(job_id)
+    job = _COMPARISON_JOBS.get(job_id)
     if job is None or job.owner != current_user.email:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "NOT_FOUND", "message": "Comparison job not found"},
         )
     return StreamingResponse(
-        _stream_job_events(job_id, current_user.email),
+        _stream_comparison_job_events(job_id, current_user.email),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

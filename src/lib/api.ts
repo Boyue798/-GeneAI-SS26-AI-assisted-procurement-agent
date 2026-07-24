@@ -1,23 +1,20 @@
-// ---------------------------------------------------------------------------
 // HTTP API client — the single integration seam to the backend.
-//
 // Toggle: set VITE_API_BASE_URL (e.g. in .env.local or Vercel env).
-//   - NOT set  → `apiEnabled` is false → the app keeps using mock data /
-//                localStorage exactly as before (offline prototype mode).
+//   - NOT set  → `apiEnabled` is false → the app keeps using mock data / localStorage exactly as before (offline prototype mode).
 //   - set      → every data call goes to the real REST backend.
-//
 // Endpoints + payload shapes follow docs/PROJECT_TASKS.md (Lane D) and the
 // types in src/types.ts. Backend devs: make your API match this and the
 // frontend just works — no frontend changes needed.
-// ---------------------------------------------------------------------------
-
 import type {
   AuthUser,
   ComparisonItem,
   ConversationRecord,
   DeliveryOptionKey,
+  EvaluationCriterion,
   FeedbackRecord,
   Supplier,
+  SupplierDirectoryEntry,
+  SupplierDirectoryInput,
   VaultKey,
 } from '../types'
 
@@ -62,6 +59,21 @@ export class ApiError extends Error {
     this.name = 'ApiError'
     this.code = code
     this.status = status
+  }
+}
+
+/** Reject a long-running request so a sleeping backend cannot hold the UI forever. */
+export async function withTimeout<T>(task: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      task,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new ApiError(message, 'TIMEOUT', 408)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
   }
 }
 
@@ -157,6 +169,14 @@ async function streamRequest<T>(path: string, onEvent: (event: T) => void): Prom
   if (latest === null) {
     throw new ApiError('Stream ended without data', 'STREAM_EMPTY', 0)
   }
+
+  // A proxy can close an SSE connection while the backend job is still running.
+  // Returning that snapshot makes callers render its empty, in-progress results
+  // instead of using their existing polling fallback.
+  const status = (latest as { status?: unknown }).status
+  if (status !== 'completed' && status !== 'failed') {
+    throw new ApiError('Stream ended before the job completed', 'STREAM_INCOMPLETE', 0)
+  }
   return latest
 }
 
@@ -166,6 +186,8 @@ export interface ComparisonFilters {
   minPrice?: number
   maxPrice?: number
   deliveryTime?: DeliveryOptionKey
+  /** Target market passed to price providers and the procurement intent parser. */
+  country?: string
 }
 
 /** Structured fields for the sourcing module's form input. */
@@ -174,9 +196,16 @@ export interface SourcingStructuredFields {
   quantity?: string
   unit?: string
   brand?: string
+  model?: string
+  specifications?: string
+  standards?: string
   category?: string
   country?: string
+  targetRegion?: string
   certifications?: string
+  minOrderQuantity?: string
+  qualityRequirements?: string
+  environmentalRequirements?: string
 }
 
 export interface SourcingJobEvent {
@@ -256,26 +285,35 @@ export const api = {
     remove: (id: string) => request<void>(`/api/vault/keys/${id}`, { method: 'DELETE' }),
   },
 
+  supplierDirectory: {
+    list: () => request<SupplierDirectoryEntry[]>('/api/suppliers'),
+    create: (entry: SupplierDirectoryInput) =>
+      request<SupplierDirectoryEntry>('/api/suppliers', { method: 'POST', body: entry }),
+    update: (id: string, changes: Partial<SupplierDirectoryInput>) =>
+      request<SupplierDirectoryEntry>(`/api/suppliers/${id}`, { method: 'PATCH', body: changes }),
+    remove: (id: string) => request<void>(`/api/suppliers/${id}`, { method: 'DELETE' }),
+  },
+
   sourcing: {
-    search: (query: string, structured?: SourcingStructuredFields) =>
-      request<{ results: Supplier[] }>('/api/sourcing/search', { method: 'POST', body: { query, structured } }),
-    createJob: (query: string, structured?: SourcingStructuredFields) =>
-      request<SourcingJob>('/api/sourcing/search-jobs', { method: 'POST', body: { query, structured } }),
+    search: (query: string, structured?: SourcingStructuredFields, criteria?: EvaluationCriterion[]) =>
+      request<{ results: Supplier[]; intent?: Record<string, unknown> | null }>('/api/sourcing/search', { method: 'POST', body: { query, structured, criteria } }),
+    createJob: (query: string, structured?: SourcingStructuredFields, criteria?: EvaluationCriterion[]) =>
+      request<SourcingJob>('/api/sourcing/search-jobs', { method: 'POST', body: { query, structured, criteria } }),
     getJob: (jobId: string) => request<SourcingJob>(`/api/sourcing/search-jobs/${jobId}`),
     streamJob: (jobId: string, onEvent: (job: SourcingJob) => void) =>
       streamRequest<SourcingJob>(`/api/sourcing/search-jobs/${jobId}/events`, onEvent),
   },
 
   comparison: {
-    search: (query: string, filters: ComparisonFilters) =>
-      request<{ results: ComparisonItem[] }>('/api/comparison/search', {
+    search: (query: string, filters: ComparisonFilters, weights?: { price: number; delivery: number; rating: number }, criteria?: EvaluationCriterion[]) =>
+      request<{ results: ComparisonItem[]; intent?: Record<string, unknown> | null }>('/api/comparison/search', {
         method: 'POST',
-        body: { query, ...filters },
+        body: { query, ...filters, weights, criteria },
       }),
-    createJob: (query: string, filters: ComparisonFilters, weights?: { price: number; delivery: number; rating: number }) =>
+    createJob: (query: string, filters: ComparisonFilters, weights?: { price: number; delivery: number; rating: number }, criteria?: EvaluationCriterion[]) =>
       request<ComparisonJob>('/api/comparison/search-jobs', {
         method: 'POST',
-        body: { query, ...filters, weights },
+        body: { query, ...filters, weights, criteria },
       }),
     getJob: (jobId: string) => request<ComparisonJob>(`/api/comparison/search-jobs/${jobId}`),
     streamJob: (jobId: string, onEvent: (job: ComparisonJob) => void) =>
