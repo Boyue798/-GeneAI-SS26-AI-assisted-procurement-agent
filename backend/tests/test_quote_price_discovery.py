@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
@@ -78,6 +80,318 @@ class QuotePriceDiscoveryTest(unittest.TestCase):
         self.assertEqual(ProcurementAgent._extract_eur_price("Preis € 1.234,56"), 1234.56)
         self.assertEqual(ProcurementAgent._extract_eur_price("nur 4,99 EUR"), 4.99)
         self.assertEqual(ProcurementAgent._extract_eur_price("ab € 25,-"), 25.0)
+        self.assertEqual(ProcurementAgent._extract_eur_price("Preis ab EUR 841,17"), 841.17)
+        self.assertEqual(ProcurementAgent._extract_eur_price('"lowPrice":"1.299,00","priceCurrency":"EUR"'), 1299.0)
+        self.assertEqual(ProcurementAgent._extract_eur_price("€ 1.234"), 1234.0)
+
+    def test_model_identifier_survives_search_keyword_translation(self):
+        self.assertEqual(
+            ProcurementAgent._quote_model_identifiers("德国采购 Philips XC2011/01 无线吸尘器"),
+            ["XC2011/01"],
+        )
+        self.assertEqual(
+            ProcurementAgent._quote_model_identifiers("购买 A4 复印纸 80g"),
+            [],
+        )
+        self.assertEqual(
+            ProcurementAgent._quote_model_identifiers("Logitech B100 Maus USB"),
+            ["B100"],
+        )
+
+    def test_model_and_brand_constrain_marketplace_search_and_relevance(self):
+        intent = ProcurementIntent(category="accessory", country="Germany", keywords=["Logitech", "B100", "Maus"])
+
+        self.assertEqual(
+            ProcurementAgent._quote_search_product_phrase("Logitech B100 Maus USB", intent),
+            "logitech B100 maus",
+        )
+        self.assertTrue(
+            ProcurementAgent._is_relevant_quote_item(
+                {"product": "Logitech B100 Maus mit Kabel USB", "unitPriceEur": 8.99},
+                "Logitech B100 Maus USB",
+                intent,
+            )
+        )
+        self.assertFalse(
+            ProcurementAgent._is_relevant_quote_item(
+                {"product": "Razer DeathAdder Essential Maus", "unitPriceEur": 16.52},
+                "Logitech B100 Maus USB",
+                intent,
+            )
+        )
+
+    def test_high_value_web_product_keeps_its_extracted_price(self):
+        async def scenario():
+            agent = ProcurementAgent.__new__(ProcurementAgent)
+            intent = ProcurementIntent(category="hardware", country="Germany", keywords=["laptop"])
+            candidate = await agent._web_quote_candidate_from_result(
+                SearchResult(
+                    title="HP EliteBook 840 G9 Laptop € 841.17",
+                    url="https://shop.example/hp-elitebook",
+                    snippet="Business laptop with public web price",
+                ),
+                intent,
+                0,
+                "HP EliteBook laptop",
+            )
+
+            self.assertIsNotNone(candidate)
+            self.assertEqual(candidate["unitPriceEur"], 841.17)
+            self.assertEqual(candidate["priceConfidence"], "extracted")
+            self.assertNotEqual(candidate["unitLabel"], "需人工核价")
+
+        asyncio.run(scenario())
+
+    def test_marketplace_results_can_short_circuit_slow_web_search(self):
+        class FakeParser:
+            async def parse(self, _query: str):
+                return ProcurementIntent(category="hardware", country="Germany", keywords=["laptop"])
+
+        class FakeMarketplace:
+            enabled = True
+
+            def __init__(self):
+                self.country = None
+
+            async def search(self, _query: str, **_kwargs):
+                self.country = _kwargs.get("country")
+                return [
+                    {
+                        "id": f"marketplace-ebay-{index}",
+                        "vendor": "eBay seller",
+                        "platform": "eBay Browse API",
+                        "product": f"Business Laptop {index}",
+                        "description": "Business laptop",
+                        "unitPriceEur": 800.0 + index,
+                        "unitLabel": f"€ {800.0 + index:.2f}",
+                        "deliveryDays": 3,
+                        "deliveryLabel": "3 Tage",
+                        "paymentTerm": "prepayment",
+                        "paymentLabel": "需确认付款方式",
+                        "deliveryMethod": "parcel",
+                        "rating": 4.5,
+                        "reviews": 10,
+                        "source": "web",
+                        "sourceDetail": "marketplace:ebay",
+                        "sourceUrls": [f"https://www.ebay.de/itm/{index}"],
+                        "priceConfidence": "api",
+                        "matchScore": 80,
+                    }
+                    for index in range(3)
+                ]
+
+        class FakeRanker:
+            async def rank_quotes(self, _query: str, candidates: list[dict], **_kwargs):
+                return candidates
+
+        async def scenario():
+            agent = ProcurementAgent.__new__(ProcurementAgent)
+            agent.llm = None
+            agent.parser = FakeParser()
+            agent.quotes = []
+            marketplace = FakeMarketplace()
+            agent.marketplace_search = marketplace
+            agent.ranker = FakeRanker()
+            agent._search_web_quotes = AsyncMock(side_effect=AssertionError("web search should be skipped"))
+            agent._llm_filter_relevant_quotes = AsyncMock(side_effect=AssertionError("LLM review should be skipped"))
+
+            with patch("agent.procurement_agent.search_idealo", new_callable=AsyncMock) as idealo:
+                result = await agent.search_quotes("business laptop", country="Poland")
+
+            self.assertEqual(len(result["results"]), 3)
+            self.assertTrue(all(item["priceConfidence"] == "api" for item in result["results"]))
+            self.assertEqual(marketplace.country, "Poland")
+            self.assertEqual(result["intent"]["country"], "Poland")
+            agent._search_web_quotes.assert_not_awaited()
+            agent._llm_filter_relevant_quotes.assert_not_awaited()
+            idealo.assert_not_awaited()
+
+        asyncio.run(scenario())
+
+    def test_insufficient_marketplace_results_keep_idealo_and_web_fallbacks(self):
+        class FakeParser:
+            async def parse(self, _query: str):
+                return ProcurementIntent(category="hardware", country="Germany", keywords=["laptop"])
+
+        class FakeMarketplace:
+            enabled = True
+
+            async def search(self, _query: str, **_kwargs):
+                return [
+                    {
+                        "id": f"marketplace-serpapi-{index}",
+                        "vendor": "Shopping seller",
+                        "platform": "Google Shopping (SerpApi)",
+                        "product": f"Business Laptop {index}",
+                        "unitPriceEur": 800.0 + index,
+                        "unitLabel": f"€ {800.0 + index:.2f}",
+                        "deliveryDays": 3,
+                        "deliveryLabel": "3 Tage",
+                        "paymentTerm": "prepayment",
+                        "paymentLabel": "需确认付款方式",
+                        "deliveryMethod": "parcel",
+                        "rating": 4.5,
+                        "reviews": 10,
+                        "source": "web",
+                        "sourceDetail": "marketplace:serpapi",
+                        "sourceUrls": [f"https://shopping.example/{index}"],
+                        "priceConfidence": "api",
+                        "matchScore": 80,
+                    }
+                    for index in range(2)
+                ]
+
+        class FakeRanker:
+            async def rank_quotes(self, _query: str, candidates: list[dict], **_kwargs):
+                return candidates
+
+        async def scenario():
+            agent = ProcurementAgent.__new__(ProcurementAgent)
+            agent.llm = None
+            agent.parser = FakeParser()
+            agent.quotes = []
+            agent.marketplace_search = FakeMarketplace()
+            agent.ranker = FakeRanker()
+            agent._search_web_quotes = AsyncMock(return_value=[])
+
+            with patch("agent.procurement_agent.search_idealo", new_callable=AsyncMock, return_value=[]) as idealo:
+                result = await agent.search_quotes("business laptop")
+
+            self.assertEqual(len(result["results"]), 2)
+            idealo.assert_awaited_once()
+            agent._search_web_quotes.assert_awaited_once()
+
+        asyncio.run(scenario())
+
+    def test_slow_supplement_keeps_priced_marketplace_candidate(self):
+        class FakeParser:
+            async def parse(self, _query: str):
+                return ProcurementIntent(category="hardware", country="Germany", keywords=["laptop"])
+
+        class FakeMarketplace:
+            enabled = True
+
+            async def search(self, _query: str, **_kwargs):
+                return [{
+                    "id": "marketplace-laptop",
+                    "vendor": "Verified Market Seller",
+                    "platform": "Google Shopping (SerpApi)",
+                    "product": "Business Laptop",
+                    "description": "Business laptop with public EUR price",
+                    "unitPriceEur": 799.0,
+                    "unitLabel": "€ 799.00",
+                    "deliveryDays": 3,
+                    "deliveryLabel": "3 Tage",
+                    "paymentTerm": "prepayment",
+                    "paymentLabel": "需确认付款方式",
+                    "deliveryMethod": "parcel",
+                    "rating": 4.5,
+                    "reviews": 10,
+                    "source": "web",
+                    "sourceDetail": "marketplace:serpapi",
+                    "sourceUrls": ["https://shopping.example/laptop"],
+                    "priceConfidence": "api",
+                    "matchScore": 80,
+                }]
+
+        class FakeRanker:
+            async def rank_quotes(self, _query: str, candidates: list[dict], **_kwargs):
+                return candidates
+
+        async def slow_web_search(*_args, **_kwargs):
+            await asyncio.sleep(1)
+            return []
+
+        async def scenario():
+            agent = ProcurementAgent.__new__(ProcurementAgent)
+            agent.llm = None
+            agent.parser = FakeParser()
+            agent.quotes = []
+            agent.marketplace_search = FakeMarketplace()
+            agent.ranker = FakeRanker()
+            agent._search_web_quotes = slow_web_search
+            agent._quote_web_fallback_timeout_seconds = lambda **_kwargs: 0.01
+
+            async def slow_idealo(*_args, **_kwargs):
+                await asyncio.sleep(1)
+                return []
+
+            with patch("agent.procurement_agent.search_idealo", new=slow_idealo):
+                result = await agent.search_quotes("business laptop")
+
+            self.assertEqual(len(result["results"]), 1)
+            self.assertEqual(result["results"][0]["vendor"], "Verified Market Seller")
+
+        asyncio.run(scenario())
+
+    def test_poland_with_insufficient_api_results_skips_idealo_and_uses_web_fallback(self):
+        class FakeParser:
+            async def parse(self, _query: str):
+                return ProcurementIntent(category="hardware", country="Germany", keywords=["laptop"])
+
+        class FakeRanker:
+            async def rank_quotes(self, _query: str, candidates: list[dict], **_kwargs):
+                return candidates
+
+        async def scenario():
+            agent = ProcurementAgent.__new__(ProcurementAgent)
+            agent.llm = None
+            agent.parser = FakeParser()
+            agent.quotes = []
+            agent.marketplace_search = None
+            agent.ranker = FakeRanker()
+            agent._search_web_quotes = AsyncMock(return_value=[])
+
+            with patch("agent.procurement_agent.search_idealo", new_callable=AsyncMock, return_value=[]) as idealo:
+                await agent.search_quotes("business laptop", country="Poland")
+
+            idealo.assert_not_awaited()
+            agent._search_web_quotes.assert_awaited_once()
+
+        asyncio.run(scenario())
+
+    def test_no_marketplace_configuration_keeps_default_germany_idealo_fallback(self):
+        class FakeParser:
+            async def parse(self, _query: str):
+                return ProcurementIntent(category="hardware", country=None, keywords=["laptop"])
+
+        class FakeRanker:
+            async def rank_quotes(self, _query: str, candidates: list[dict], **_kwargs):
+                return candidates
+
+        async def scenario():
+            agent = ProcurementAgent.__new__(ProcurementAgent)
+            agent.llm = None
+            agent.parser = FakeParser()
+            agent.quotes = []
+            agent.marketplace_search = None
+            agent.ranker = FakeRanker()
+            agent._search_web_quotes = AsyncMock(return_value=[])
+
+            with patch("agent.procurement_agent.search_idealo", new_callable=AsyncMock, return_value=[]) as idealo:
+                await agent.search_quotes("business laptop")
+
+            idealo.assert_awaited_once()
+            agent._search_web_quotes.assert_awaited_once()
+
+        asyncio.run(scenario())
+
+    def test_non_german_web_queries_are_country_qualified_without_idealo(self):
+        poland_intent = ProcurementIntent(category="hardware", country="Poland", keywords=["laptop"])
+        poland_site_queries = ProcurementAgent._quote_site_specific_queries("business laptop", "Poland")
+        poland_extra_queries = ProcurementAgent._quote_price_search_queries("business laptop", poland_intent)
+        europe_site_queries = ProcurementAgent._quote_site_specific_queries("business laptop", "Europe")
+
+        for queries, market in ((poland_site_queries, "Poland"), (poland_extra_queries, "Poland"), (europe_site_queries, "Europe")):
+            self.assertTrue(all(market in query for query in queries), queries)
+            self.assertTrue(all("Deutschland" not in query and "idealo.de" not in query for query in queries), queries)
+
+    def test_idealo_timeout_has_a_usable_default_and_is_configurable(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("IDEALO_TIMEOUT_SECONDS", None)
+            self.assertEqual(ProcurementAgent._idealo_timeout_seconds(), 20.0)
+        with patch.dict(os.environ, {"IDEALO_TIMEOUT_SECONDS": "45"}, clear=False):
+            self.assertEqual(ProcurementAgent._idealo_timeout_seconds(), 45.0)
 
     def test_static_fetcher_preserves_json_ld_price_fragments(self):
         html = (

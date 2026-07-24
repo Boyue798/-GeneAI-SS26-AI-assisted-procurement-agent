@@ -105,13 +105,21 @@ CREATE TABLE sourcing_session (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 候选供应商（网络搜索到的临时区，确认后转入正式 supplier 表）
+-- 注意：此表结构匹配 db_writer.py 的实际使用方式
 CREATE TABLE sourcing_candidate (
     id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    session_id   BIGINT NOT NULL REFERENCES sourcing_session(id) ON DELETE CASCADE,
-    supplier_id  BIGINT REFERENCES supplier(id) ON DELETE SET NULL,
-    relevance    NUMERIC(6,3),
-    quality_note TEXT,
-    is_incumbent BOOLEAN NOT NULL DEFAULT FALSE
+    name         TEXT NOT NULL,
+    origin       supplier_origin NOT NULL DEFAULT 'web',
+    website      TEXT,
+    country      TEXT,
+    contact_name TEXT,
+    contact_email TEXT,
+    contact_phone TEXT,
+    scale        TEXT,
+    rating       NUMERIC(3,2),
+    attributes   JSONB NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE report (
@@ -173,7 +181,9 @@ CREATE INDEX idx_quote_supplier    ON quote(supplier_id);
 CREATE INDEX idx_quote_captured    ON quote(captured_at DESC);
 CREATE INDEX idx_quote_selected    ON quote(product_id) WHERE is_selected;
 CREATE INDEX idx_reqitem_request   ON request_item(request_id);
-CREATE INDEX idx_candidate_session ON sourcing_candidate(session_id);
+-- sourcing_candidate has no session_id in this schema.  Index the actual
+-- de-duplication / promotion key used by db_writer.py instead.
+CREATE INDEX idx_candidate_name ON sourcing_candidate(name);
 CREATE INDEX idx_purchase_product  ON purchase_history(product_id);
 CREATE INDEX idx_purchase_supplier ON purchase_history(supplier_id);
 CREATE INDEX idx_conversation_history_user_time ON conversation_history(user_email, timestamp_ms DESC);

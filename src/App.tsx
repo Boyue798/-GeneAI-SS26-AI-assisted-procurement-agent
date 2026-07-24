@@ -53,7 +53,7 @@ function Workspace({
   }
 
   return (
-    <div className="flex h-screen w-full flex-col overflow-hidden bg-slate-100 print:h-auto print:overflow-visible">
+    <div className="procurement-shell flex min-h-[100dvh] w-full flex-col overflow-hidden print:h-auto print:overflow-visible">
       <TopNavbar
         moduleTitle={t.module[activeModule].title}
         subtitle={t.module[activeModule].subtitle}
@@ -61,10 +61,10 @@ function Workspace({
         onLanguageChange={setLanguage}
         t={t}
       />
-      <div className="flex min-h-0 flex-1 overflow-hidden print:overflow-visible">
+      <div className="procurement-workspace flex min-h-0 flex-1 overflow-hidden print:overflow-visible">
         <Sidebar active={activeModule} onChange={goToModule} t={t} />
-        <main className="min-w-0 flex-1 overflow-y-auto bg-slate-100 p-8 print:overflow-visible print:p-0">
-          <section className={activeModule === 'sourcing' ? 'block' : 'hidden'} aria-hidden={activeModule !== 'sourcing'}>
+        <main className="procurement-main min-h-0 min-w-0 flex-1 overflow-y-auto print:overflow-visible print:p-0">
+          <section className={activeModule === 'sourcing' ? 'procurement-module is-active block' : 'hidden'} aria-hidden={activeModule !== 'sourcing'}>
             <ErrorBoundary
               onError={() => console.error('[App] SourcingModule crashed')}
               fallback={
@@ -82,7 +82,7 @@ function Workspace({
             </ErrorBoundary>
           </section>
 
-          <section className={activeModule === 'comparison' ? 'block' : 'hidden'} aria-hidden={activeModule !== 'comparison'}>
+          <section className={activeModule === 'comparison' ? 'procurement-module is-active block' : 'hidden'} aria-hidden={activeModule !== 'comparison'}>
             <ComparisonModule
               key={moduleKeys.comparison}
               t={t}
@@ -90,11 +90,11 @@ function Workspace({
             />
           </section>
 
-          <section className={activeModule === 'memory' ? 'block' : 'hidden'} aria-hidden={activeModule !== 'memory'}>
+          <section className={activeModule === 'memory' ? 'procurement-module is-active block' : 'hidden'} aria-hidden={activeModule !== 'memory'}>
             <MemoryModule t={t} language={language} onOpen={openConversation} />
           </section>
 
-          <section className={activeModule === 'settings' ? 'block' : 'hidden'} aria-hidden={activeModule !== 'settings'}>
+          <section className={activeModule === 'settings' ? 'procurement-module is-active block' : 'hidden'} aria-hidden={activeModule !== 'settings'}>
             <SettingsPage t={t} language={language} />
           </section>
         </main>

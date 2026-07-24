@@ -1,9 +1,11 @@
 # Dependencies
 node_modules/
+node_modules
 backend/venv/
 
 # Environment (API keys, database URLs — NEVER commit)
 .env
+.env.local
 backend/.env
 
 # Python cache
@@ -37,3 +39,6 @@ backend/chroma_data/
 
 # Local user conversation data (never commit)
 backend/data/conversations/
+backend/.venv/
+backend/data/supplier_directory.local.json
+backend/data/supplier_directory.local.json.tmp

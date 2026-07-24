@@ -21,6 +21,7 @@ from api.sourcing import (
     create_search_job,
     get_search_job,
     reset_search_jobs_for_tests,
+    search,
 )
 
 
@@ -114,6 +115,135 @@ class SourcingJobsTest(unittest.TestCase):
         self.assertIn('"status": "running"', chunk)
         self.assertIn("正在搜索供应商", chunk)
         self.assertTrue(chunk.endswith("\n\n"))
+
+    def test_sync_search_uses_a_short_lived_cache_for_the_same_user_and_input(self):
+        class CountingAgent:
+            def __init__(self):
+                self.calls = 0
+
+            async def search_suppliers(self, query: str, structured=None, criteria=None):
+                self.calls += 1
+                return {"intent": {"query": query}, "results": [{"name": "Cached Supplier"}]}
+
+        async def scenario():
+            agent = CountingAgent()
+            request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(agent=agent)))
+            user = AuthUser(
+                email="user@fuyao.com",
+                name="Fuyao Procurement User",
+                company="Fuyao Glass",
+                role="Procurement Manager",
+            )
+            first = await search(SearchRequest(query="EPDM seal Germany"), request, user)
+            second = await search(SearchRequest(query="EPDM seal Germany"), request, user)
+            self.assertEqual(agent.calls, 1)
+            self.assertEqual(first, second)
+
+        asyncio.run(scenario())
+
+    def test_sync_search_does_not_cache_an_empty_result(self):
+        class EmptyThenPopulatedAgent:
+            def __init__(self):
+                self.calls = 0
+
+            async def search_suppliers(self, query: str, structured=None, criteria=None):
+                self.calls += 1
+                return {
+                    "intent": {"query": query},
+                    "results": [] if self.calls == 1 else [{"name": "Recovered Supplier"}],
+                }
+
+        async def scenario():
+            agent = EmptyThenPopulatedAgent()
+            request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(agent=agent)))
+            user = AuthUser(
+                email="retry@fuyao.com",
+                name="Retry Buyer",
+                company="Fuyao Glass",
+                role="Procurement Manager",
+            )
+            first = await search(SearchRequest(query="A4 paper Germany"), request, user)
+            second = await search(SearchRequest(query="A4 paper Germany"), request, user)
+
+            self.assertEqual(first["results"], [])
+            self.assertEqual(agent.calls, 2)
+            self.assertEqual(second["results"][0]["name"], "Recovered Supplier")
+
+        asyncio.run(scenario())
+
+    def test_search_job_does_not_cache_an_empty_result(self):
+        class EmptyThenPopulatedAgent:
+            def __init__(self):
+                self.calls = 0
+
+            async def search_suppliers(self, query: str, progress=None, structured=None, criteria=None):
+                self.calls += 1
+                if progress:
+                    progress("retrieve", "已检索供应商资源", 70)
+                return {
+                    "intent": {"query": query},
+                    "results": [] if self.calls == 1 else [{"name": "Recovered Supplier"}],
+                }
+
+        async def wait_for_completion(job_id: str, user: AuthUser):
+            for _ in range(20):
+                current = await get_search_job(job_id, user)
+                if current.status == "completed":
+                    return current
+                await asyncio.sleep(0.01)
+            self.fail("search job did not complete")
+
+        async def scenario():
+            agent = EmptyThenPopulatedAgent()
+            request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(agent=agent)))
+            user = AuthUser(
+                email="retry-job@fuyao.com",
+                name="Retry Buyer",
+                company="Fuyao Glass",
+                role="Procurement Manager",
+            )
+            first_job = await create_search_job(SearchRequest(query="A4 paper Germany"), request, user)
+            first = await wait_for_completion(first_job.jobId, user)
+            second_job = await create_search_job(SearchRequest(query="A4 paper Germany"), request, user)
+            second = await wait_for_completion(second_job.jobId, user)
+
+            self.assertEqual(first.results, [])
+            self.assertEqual(agent.calls, 2)
+            self.assertEqual(second.results[0]["name"], "Recovered Supplier")
+
+        asyncio.run(scenario())
+
+    def test_sync_search_omits_new_request_kwargs_for_legacy_agent(self):
+        class LegacyAgent:
+            def __init__(self):
+                self.calls = 0
+
+            async def search_suppliers(self, query: str):
+                self.calls += 1
+                return {"intent": {"query": query}, "results": [{"name": "Legacy Supplier"}]}
+
+        async def scenario():
+            agent = LegacyAgent()
+            request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(agent=agent)))
+            user = AuthUser(
+                email="legacy@fuyao.com",
+                name="Legacy Buyer",
+                company="Fuyao Glass",
+                role="Procurement Manager",
+            )
+            result = await search(
+                SearchRequest(
+                    query="EPDM seal Germany",
+                    structured={"targetRegion": "Germany", "model": "EPDM-42"},
+                    criteria=[{"key": "quality", "weight": 100}],
+                ),
+                request,
+                user,
+            )
+            self.assertEqual(agent.calls, 1)
+            self.assertEqual(result["results"][0]["name"], "Legacy Supplier")
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":

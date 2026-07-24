@@ -34,4 +34,5 @@ export const STORAGE_KEYS = {
   language: 'fuyao.lang',
   conversations: 'fuyao.memory.conversations',
   vault: 'fuyao.vault.keys',
+  supplierDirectory: 'fuyao.supplier-directory.entries',
 } as const

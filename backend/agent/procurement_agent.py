@@ -5,12 +5,14 @@ import os
 import re
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from agent.parser import IntentParser
 from agent.ranker import LLMRanker
 from agent.retriever import SupplierRetriever
-from web_research.researcher import DuckDuckGoSearchProvider, SearchResult, StaticPageFetcher, WebResearcher
+from web_research.researcher import SearXNGSearchProvider, SearchResult, StaticPageFetcher, WebResearcher
 from web_research.idealo_scraper import search_idealo
+from web_research.marketplace import MarketplaceSearchLayer
 from web_research.wlw_scraper import search_wlw
 from database import query_suppliers_sync, query_products_sync
 
@@ -64,15 +66,38 @@ class ProcurementAgent:
         chroma_collection = self._create_chroma_collection()
         self.retriever = SupplierRetriever(chroma_collection, self.suppliers, llm=self.llm)
         self.ranker = LLMRanker(self.llm)
-        self.quote_search_provider = DuckDuckGoSearchProvider()
+        self.quote_search_provider = SearXNGSearchProvider()
         self.quote_page_fetcher = StaticPageFetcher()
+        # External marketplace APIs are optional. With no configured credentials
+        # this layer is inert and the existing Idealo/web-search path is used.
+        self.marketplace_search = MarketplaceSearchLayer()
         self.web_researcher = WebResearcher(
             search_provider=self.quote_search_provider,
             page_fetcher=self.quote_page_fetcher,
             llm=self.llm,
         )
 
-    async def search_suppliers(self, query: str, progress=None, structured: dict | None = None) -> dict:
+    def refresh_local_catalog(self) -> None:
+        """Reload editable supplier and quote data without restarting the API.
+
+        The supplier-directory API calls this after a successful write.  It is
+        deliberately synchronous because the data access layer is synchronous
+        at startup too; failed or unavailable database connections simply yield
+        an empty local catalogue and leave web research available.
+        """
+        self.suppliers = query_suppliers_sync()
+        self.quotes = query_products_sync()
+        self.retriever = SupplierRetriever(
+            self._create_chroma_collection(), self.suppliers, llm=self.llm
+        )
+
+    async def search_suppliers(
+        self,
+        query: str,
+        progress=None,
+        structured: dict | None = None,
+        criteria: list[dict] | None = None,
+    ) -> dict:
         """Full pipeline: parse → local DB → WLW B2B → WebResearcher → merge → rank.
 
         Pipeline stages:
@@ -84,6 +109,8 @@ class ProcurementAgent:
 
         structured, when provided, contains B2B-procurement fields from the
         frontend's structured form; these override LLM-parsed intent values.
+        criteria contains user-defined evaluation dimensions and weights; it
+        only changes ranking when explicitly supplied.
         """
         if progress:
             progress("parse", "正在解析您的采购需求，提取品类、地区、预算等关键信息...", 10)
@@ -94,13 +121,20 @@ class ProcurementAgent:
         if structured:
             if structured.get("category"):
                 intent.category = structured["category"]
-            if structured.get("country"):
-                intent.country = structured["country"]
-            if structured.get("certifications"):
-                certs = [c.strip().upper() for c in structured["certifications"].split(",")]
+            if structured.get("targetRegion") or structured.get("country"):
+                intent.country = structured.get("targetRegion") or structured["country"]
+            certification_text = ",".join(
+                value for value in [structured.get("certifications"), structured.get("standards")]
+                if value
+            )
+            if certification_text:
+                certs = [c.strip().upper() for c in certification_text.split(",") if c.strip()]
                 intent.certifications = list(dict.fromkeys([*certs, *intent.certifications]))
             sf_keywords = []
-            for sf_field in ["productName", "quantity", "brand"]:
+            for sf_field in [
+                "productName", "quantity", "brand", "model", "specifications",
+                "minOrderQuantity", "qualityRequirements", "environmentalRequirements",
+            ]:
                 val = structured.get(sf_field)
                 if val and val not in sf_keywords:
                     sf_keywords.append(val)
@@ -133,50 +167,44 @@ class ProcurementAgent:
                 if progress:
                     progress("parse", f"已翻译为德语搜索词：「{german_supplier_phrase}」。", 26)
 
-        # ── Phase 1: Local database (Chroma) ──────────────────────────
+        # ── Phase 1: Local + Web search in PARALLEL ──────────────────
         if progress:
-            progress("retrieve", "第一步：检索本地供应商数据库，确认是否已有可复购/可复用供应商...", 30)
+            progress("retrieve", "同时启动本地数据库和网络搜索，并行执行以最大程度缩短等待时间...", 30)
 
-        local_candidates = await self.retriever.search(intent, query=query, progress=progress)
+        async def _run_local():
+            return await self.retriever.search(intent, query=query, progress=progress)
 
-        if progress:
-            progress("retrieve", f"本地数据库：找到 {len(local_candidates)} 个候选供应商。", 44)
-
-        # ── Phase 2: WLW.de B2B directory (direct scrape) ─────────────
-        web_candidates: list[dict] = []
-        wlw_phrase = german_supplier_phrase or self._supplier_search_phrase(query, intent)
-
-        if progress:
-            progress("web", f"第二步：搜索 WLW.de B2B 供应商目录：「{wlw_phrase}」...", 44)
-
-        try:
-            wlw_results = await search_wlw(wlw_phrase, limit=5, timeout=50)
-            if progress:
-                progress("web", f"WLW.de 返回 {len(wlw_results)} 家供应商。", 50)
-            web_candidates = await self._normalize_web_suppliers(wlw_results, intent)
-        except Exception as e:
-            if progress:
-                progress("web", f"WLW.de 搜索失败（{e}），将使用搜索引擎兜底...", 50)
-            wlw_results = []
-
-        # ── Phase 3: WebResearcher (DDG + LLM) fallback ────────────────
-        if len(wlw_results) < 3:
-            if progress:
-                progress("web", f"WLW 仅返回 {len(wlw_results)} 家，启动 WebResearcher（DDG搜索+LLM识别）补充...", 52)
-
+        async def _run_web():
+            # DeepSeek web search — WLW.de results come through
+            # site:wlw.de and site:europages.de queries in researcher.
             try:
-                researcher_results = await self.web_researcher.research(
-                    intent, max_suppliers=5, progress=progress
-                )
-                if progress:
-                    progress("web", f"WebResearcher 补充了 {len(researcher_results)} 家候选供应商。", 62)
-                web_candidates = self._merge_supplier_candidates(
-                    web_candidates,
-                    await self._normalize_web_suppliers(researcher_results, intent),
+                return await self._normalize_web_suppliers(
+                    await self.web_researcher.research(intent, max_suppliers=10, progress=progress),
+                    intent,
                 )
             except Exception as e:
                 if progress:
-                    progress("web", f"WebResearcher 失败（{e}），仅使用 WLW + 本地数据库结果。", 62)
+                    progress("web", f"WebResearcher 失败: {e}", 52)
+                return []
+
+        # Execute local + web in parallel
+        local_task = asyncio.create_task(_run_local())
+        web_task = asyncio.create_task(_run_web())
+
+        local_candidates = await local_task
+        web_candidates = await web_task
+        # Both sources now conform to the same comparison-table contract.
+        local_candidates = [
+            self._ensure_supplier_contract(candidate, intent, default_source="database")
+            for candidate in local_candidates
+        ]
+        web_candidates = [
+            self._ensure_supplier_contract(candidate, intent, default_source="web")
+            for candidate in web_candidates
+        ]
+
+        if progress:
+            progress("retrieve", f"本地数据库：找到 {len(local_candidates)} 家候选供应商。", 44)
 
         # ── Phase 4: Merge all sources ─────────────────────────────────
         all_candidates = self._merge_supplier_candidates(local_candidates, web_candidates)
@@ -192,8 +220,8 @@ class ProcurementAgent:
 
         ranked = [
             supplier
-            for supplier in await self.ranker.rank_suppliers(query, all_candidates)
-            if int(supplier.get("matchScore", 0) or 0) >= 60
+            for supplier in await self.ranker.rank_suppliers(query, all_candidates, criteria=criteria)
+            if int(supplier.get("matchScore", 0) or 0) >= 50  # 轻量模式兼容：词法匹配产生较低分数
         ]
 
         top = ranked[0]["name"] if ranked else "未找到匹配供应商"
@@ -202,7 +230,9 @@ class ProcurementAgent:
             web_ranked = sum(1 for r in ranked if r.get("source") == "web")
             progress("rank", f"排序完成！共 {len(ranked)} 家（本地 {local_ranked} + 网络 {web_ranked}），最佳匹配：{top}。", 95)
 
-        return {"intent": intent.model_dump(), "results": ranked}
+        intent_payload = intent.model_dump()
+        intent_payload["appliedCriteria"] = criteria or []
+        return {"intent": intent_payload, "results": ranked}
 
     # ── Supplier web search helpers ──────────────────────────────────
 
@@ -226,67 +256,426 @@ class ProcurementAgent:
     ) -> list[dict]:
         """Normalize WLW / WebResearcher output to unified supplier format.
 
-        Ensures every candidate has the fields the ranker expects:
-        id, name, website, country, products, matchScore, source, sourceDetail, etc.
+        Each result gets the stable comparison-table fields, even where a web
+        page did not expose them.  Missing information stays ``None`` / an
+        explicit manual-check label rather than being guessed by the model.
         """
         normalized = []
         for item in web_results:
-            # Already has the right shape (e.g. from WLW)
-            if "name" in item and "website" in item:
-                # Ensure source is set
-                if "source" not in item:
-                    item["source"] = "web"
-                if "sourceDetail" not in item:
-                    item["sourceDetail"] = item.get("sourceDetail", "web")
-                normalized.append(item)
+            if not isinstance(item, dict):
                 continue
-
-            # From WebResearcher (may use different keys)
+            item = dict(item)
             name = item.get("name") or item.get("company_name") or item.get("title", "")
             website = item.get("website") or item.get("url", "")
             if not name and not website:
                 continue
+            page_text = " ".join(
+                str(item.get(key) or "")
+                for key in ("description", "title", "evidenceSnippets")
+            )
+            if (
+                item.get("is_supplier") is False
+                or self._is_supplier_noise_page(name, item)
+                or WebResearcher.is_non_supplier_page(
+                    title=name,
+                    url=website,
+                    text=page_text,
+                )
+            ):
+                continue
+            # Directory landing pages are product leads, not supplier records.
+            # Individual company URLs from the same directory remain eligible.
+            if self._is_supplier_directory_page(website):
+                continue
+            products = self._string_values(item.get("products") or item.get("matched_products"))
+            certifications = self._string_values(item.get("certifications"))
+            standards = self._string_values(item.get("standards"))
+            # Product proof is a minimum requirement for a new web supplier.
+            # Keep locally curated records even if incomplete, but do not add
+            # a generic directory/company page to the decision table merely
+            # because it exposes a contact address.
+            if not products:
+                continue
+            source_urls = self._string_values(item.get("sourceUrls")) or ([website] if website else [])
+            evidence = self._string_values(item.get("evidenceSnippets"))
+            verification_status, verification_notes = self._supplier_verification(
+                website=website,
+                products=products,
+                certifications=certifications,
+                phone=item.get("phone"),
+                email=item.get("email"),
+                required_certifications=getattr(intent, "certifications", None),
+            )
+            # Keep the public provenance vocabulary small and stable.  The web
+            # researcher uses more specific internal labels (for example
+            # ``web-research-llm``); exposing those values made the frontend
+            # classify valid web rows as local database records.
+            raw_source = str(item.get("source") or "").strip().casefold()
+            public_source = "database" if raw_source in {"database", "local"} else "web"
+            source_detail = item.get("sourceDetail") or raw_source or "web"
             normalized.append({
+                **item,
                 "id": item.get("id", f"web-{abs(hash(website or name)) % 10_000_000}"),
                 "name": name or "Web Supplier",
                 "website": website,
+                "category": item.get("category") or getattr(intent, "category", None) or "general",
                 "country": item.get("country") or item.get("location", ""),
                 "city": item.get("city", ""),
                 "description": item.get("description", ""),
-                "products": item.get("products") or item.get("matched_products") or [],
-                "capabilities": item.get("capabilities") or item.get("supplier_type") or [],
-                "certifications": item.get("certifications", []),
+                "products": products,
+                "productName": item.get("productName") or item.get("product") or (products[0] if products else None),
+                "brand": item.get("brand"),
+                "model": item.get("model"),
+                "specifications": item.get("specifications") or item.get("specification"),
+                "standards": standards,
+                "capabilities": self._string_values(item.get("capabilities") or item.get("supplier_type")),
+                "certifications": certifications,
                 "matchScore": item.get("matchScore") or item.get("score", 60),
                 "phone": item.get("phone", ""),
                 "email": item.get("email", ""),
                 "contactPerson": item.get("contactPerson") or item.get("contact_person", ""),
                 "employees": item.get("employees") or item.get("employee_count", ""),
-                "source": item.get("source", "web"),
-                "sourceDetail": item.get("sourceDetail", "web"),
-                "sourceUrls": item.get("sourceUrls") or ([website] if website else []),
-                "evidenceSnippets": item.get("evidenceSnippets", []),
+                "source": public_source,
+                "sourceDetail": source_detail,
+                "sourceUrls": source_urls,
+                "evidenceSnippets": evidence,
                 "is_supplier": item.get("is_supplier", True),
-                # Extra fields from WLW
+                "unitPriceEur": item.get("unitPriceEur"),
+                "unitLabel": item.get("unitLabel") or "需人工核价",
+                "quoteConditions": item.get("quoteConditions"),
+                "deliveryDays": item.get("deliveryDays"),
+                "deliveryLabel": item.get("deliveryLabel") or item.get("delivery_range") or "需确认交期",
+                "paymentTerm": item.get("paymentTerm"),
+                "paymentLabel": item.get("paymentLabel") or "需确认付款方式",
+                # Crawler-provided verification flags are not trusted.  The
+                # deterministic evidence check below is the source of truth.
+                "verificationStatus": verification_status,
+                "verificationNotes": verification_notes,
+                # Extra fields from WLW / web extraction.
                 "supplier_type": item.get("supplier_type", []),
                 "founding_year": item.get("founding_year"),
                 "delivery_range": item.get("delivery_range", ""),
             })
-        return normalized
+        return [
+            self._ensure_supplier_contract(candidate, intent, default_source="web")
+            for candidate in normalized
+        ]
+
+    @staticmethod
+    def _string_values(value) -> list[str]:
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    @classmethod
+    def _ensure_supplier_contract(cls, item: dict, intent, default_source: str) -> dict:
+        """Fill stable supplier-result fields without fabricating missing data."""
+        result = dict(item)
+        products = cls._string_values(result.get("products") or result.get("matched_products"))
+        certifications = cls._string_values(result.get("certifications"))
+        standards = cls._string_values(result.get("standards"))
+        website = str(result.get("website") or result.get("url") or "")
+        source_urls = cls._string_values(result.get("sourceUrls")) or ([website] if website else [])
+        evidence = cls._string_values(result.get("evidenceSnippets"))
+        verification_status, verification_notes = cls._supplier_verification(
+            website=website,
+            products=products,
+            certifications=certifications,
+            phone=result.get("phone"),
+            email=result.get("email"),
+            required_certifications=getattr(intent, "certifications", None),
+        )
+        # Do not expose page numbers, SKUs or URL fragments as contact data.
+        # They remain available in the evidence/source page for manual review,
+        # but the structured contact columns should only contain usable values.
+        phone = result.get("phone") if cls._valid_phone(result.get("phone")) else ""
+        email = result.get("email") if cls._valid_email(result.get("email")) else ""
+        is_web_result = default_source == "web" or str(result.get("source") or "").casefold().startswith("web")
+        unit_price = result.get("unitPriceEur")
+        if unit_price is None:
+            unit_price = result.get("unitPrice")
+        if unit_price is None:
+            unit_price = result.get("price")
+        # Supplier pages often expose an explicit EUR price in the captured
+        # evidence even when the extractor did not map it to a field. Promote
+        # only that explicit evidence; never infer a currency or invent a
+        # quote from a phone number, ID, or vague price text.
+        price_label = None
+        if unit_price is None and is_web_result:
+            evidence_text = " ".join(
+                [*evidence, str(result.get("description") or ""), str(result.get("quoteConditions") or "")]
+            )
+            range_match = re.search(
+                r"([0-9][0-9.,]*)\s*[-–]\s*([0-9][0-9.,]*)\s*(?:EUR|Euro|€)",
+                evidence_text,
+                flags=re.IGNORECASE,
+            )
+            if range_match:
+                low = cls._parse_price_number(range_match.group(1))
+                high = cls._parse_price_number(range_match.group(2))
+                if low is not None and high is not None and 0.08 < low <= high < 100000:
+                    unit_price = high
+                    price_label = f"€ {low:.2f}–{high:.2f}"
+            if unit_price is None:
+                unit_price = cls._extract_eur_price(evidence_text)
+        price_confidence = result.get("priceConfidence")
+        if not price_confidence:
+            price_confidence = "extracted" if unit_price is not None else "unknown"
+        delivery_label = result.get("deliveryLeadTime") or result.get("deliveryLabel") or result.get("delivery_range") or "需确认交期"
+        payment_terms = result.get("paymentTerms") or result.get("paymentLabel") or result.get("paymentTerm") or "需确认付款方式"
+        valid_contact = cls._has_valid_contact(result.get("phone"), result.get("email"))
+        completeness_fields = [
+            bool(website), bool(products), bool(result.get("phone") or result.get("email")),
+            bool(certifications), unit_price is not None,
+            delivery_label != "需确认交期", payment_terms != "需确认付款方式",
+        ]
+        completeness_fields[2] = valid_contact
+        result.update({
+            "id": result.get("id") or f"{default_source}-{abs(hash(website or result.get('name', 'supplier'))) % 10_000_000}",
+            "name": result.get("name") or result.get("company_name") or "Supplier",
+            "category": result.get("category") or getattr(intent, "category", None) or "general",
+            "country": result.get("country") or result.get("location") or "",
+            "city": result.get("city") or "",
+            "address": result.get("address") or "",
+            "website": website,
+            "products": products,
+            "productName": result.get("productName") or result.get("product") or (products[0] if products else None),
+            "brand": result.get("brand"),
+            "model": result.get("model"),
+            "specifications": result.get("specifications") or result.get("specification"),
+            "standards": standards,
+            "capabilities": cls._string_values(result.get("capabilities") or result.get("supplier_type")),
+            "certifications": certifications,
+            "contactPerson": result.get("contactPerson") or result.get("contact_person") or "",
+            "phone": phone,
+            "email": email,
+            "employees": result.get("employees") or result.get("employee_count") or "",
+            "annualRevenue": result.get("annualRevenue") or "",
+            "established": result.get("established") or result.get("founding_year"),
+            "unitPriceEur": unit_price,
+            # Compatibility names used by the sourcing comparison table and
+            # its Excel export.  Keep the canonical *Eur fields too.
+            "unitPrice": unit_price,
+            "currency": result.get("currency") or "EUR",
+            "unitLabel": (
+                price_label
+                or (f"€ {float(unit_price):.2f}" if unit_price is not None and result.get("unitLabel") in (None, "", "需人工核价") else None)
+                or result.get("unitLabel")
+                or "需人工核价"
+            ),
+            "priceConfidence": price_confidence,
+            "quoteConditions": result.get("quoteConditions"),
+            "deliveryDays": result.get("deliveryDays"),
+            "deliveryLabel": delivery_label,
+            "deliveryLeadTime": delivery_label,
+            "paymentTerm": result.get("paymentTerm"),
+            "paymentLabel": payment_terms,
+            "paymentTerms": payment_terms,
+            "source": result.get("source") or default_source,
+            "sourceDetail": result.get("sourceDetail") or default_source,
+            "sourceUrls": source_urls,
+            "evidenceSnippets": evidence,
+            # For web candidates, an upstream "verified" flag must not mask a
+            # malformed URL/page-id contact value. Local database provenance is
+            # preserved, while still falling back to deterministic evidence.
+            "verificationStatus": verification_status if is_web_result else result.get("verificationStatus") or verification_status,
+            "verificationNotes": verification_notes if is_web_result else result.get("verificationNotes") or verification_notes,
+            "dataCompleteness": round(sum(completeness_fields) / len(completeness_fields) * 100),
+            "matchScore": result.get("matchScore") or result.get("score") or 60,
+        })
+        if default_source == "database":
+            result.setdefault("repurchasePriority", "database")
+        return result
+
+    @staticmethod
+    def _valid_phone(value) -> bool:
+        """Accept formatted phone-like values, not URLs or numeric IDs."""
+        if not isinstance(value, str):
+            return False
+        text = value.strip()
+        lowered = text.casefold()
+        if (
+            not text
+            or lowered.startswith(("www.", "mailto:"))
+            or "://" in text
+            or "/" in text
+            or "\\" in text
+            or "@" in text
+            or re.search(r"\b(?:id|page|number|no|sku|listing)\b", lowered)
+            or re.fullmatch(r"20\d{2}\s*[-–/]\s*20\d{2}", text)
+        ):
+            return False
+        digits = re.sub(r"\D", "", text)
+        if not 7 <= len(digits) <= 15:
+            return False
+        # A bare numeric token is indistinguishable from a crawler record ID;
+        # require a phone separator or international prefix as evidence.
+        return bool(re.search(r"[+()\-.,\s]", text))
+
+    @staticmethod
+    def _valid_email(value) -> bool:
+        if not isinstance(value, str):
+            return False
+        text = value.strip()
+        return bool(
+            re.fullmatch(
+                r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+",
+                text,
+            )
+        )
+
+    @classmethod
+    def _has_valid_contact(cls, phone, email) -> bool:
+        return cls._valid_phone(phone) or cls._valid_email(email)
+
+    @staticmethod
+    def _is_supplier_directory_page(value: object) -> bool:
+        """Recognize directory/search landing pages that are not companies."""
+        if not isinstance(value, str) or not value.strip():
+            return False
+        parsed = urlparse(value if "://" in value else f"https://{value}")
+        host = (parsed.hostname or "").casefold().removeprefix("www.")
+        path = (parsed.path or "").casefold()
+        if not any(
+            marker in host
+            for marker in (
+                "europages", "wlw.", "werliefertwas", "kompass", "industrystock",
+                "lieferanten.", "directindustry",
+            )
+        ):
+            return False
+        return any(
+            marker in path
+            for marker in (
+                "/showroom/", "/search/", "/suche/", "/recherche/", "/companies/",
+                "/unternehmen/", "/suppliers/", "/lieferanten/", "/tag/",
+            )
+        )
+
+    @staticmethod
+    def _is_supplier_noise_page(name: object, item: dict) -> bool:
+        """Reject maintenance/login/error pages masquerading as suppliers."""
+        normalized_name = str(name or "").strip().casefold()
+        if normalized_name in {"web supplier", "supplier", "unknown supplier", "supplier directory"}:
+            return True
+        website = str(item.get("website") or item.get("url") or "").casefold()
+        if any(host in website for host in ("apps.apple.com", "play.google.com", "appstore.com")):
+            return True
+        text = " ".join(
+            str(item.get(key) or "")
+            for key in ("description", "title", "evidenceSnippets")
+        ).casefold()
+        return any(
+            marker in text
+            for marker in (
+                "site under maintenance", "scheduled maintenance", "access denied",
+                "captcha verification", "request unsuccessful", "enable javascript",
+            )
+        )
+
+    @classmethod
+    def _supplier_verification(
+        cls,
+        *,
+        website: str,
+        products: list[str],
+        certifications: list[str],
+        phone,
+        email,
+        required_certifications: list[str] | None = None,
+    ) -> tuple[str, list[str]]:
+        """Return transparent, deterministic verification metadata for web rows."""
+        missing: list[str] = []
+        if not website:
+            missing.append("缺少官网链接")
+        if not products:
+            missing.append("缺少产品证据")
+        has_valid_contact = cls._has_valid_contact(phone, email)
+        if not has_valid_contact:
+            missing.append("缺少可验证联系方式")
+        provided_certifications = {
+            re.sub(r"[^a-z0-9]", "", str(cert).casefold())
+            for cert in certifications
+            if str(cert).strip()
+        }
+        requested = [
+            str(cert).strip()
+            for cert in (required_certifications or [])
+            if str(cert).strip()
+        ]
+        if requested:
+            for certification in requested:
+                normalized = re.sub(r"[^a-z0-9]", "", certification.casefold())
+                if normalized and normalized not in provided_certifications:
+                    missing.append(f"未找到所需认证：{certification}")
+        elif not certifications:
+            missing.append("未发现认证信息")
+        # A contact value is a hard verification gate.  A URL, page number, or
+        # bare numeric ID must never turn a crawler row into "verified" merely
+        # because the other fields happen to be present.
+        return ("verified" if has_valid_contact and not missing else "needs-review", missing)
 
     @staticmethod
     def _merge_supplier_candidates(
         local: list[dict], web: list[dict]
     ) -> list[dict]:
-        """Merge local + web supplier candidates, deduplicate by website URL."""
+        """Merge local + web candidates and preserve local provenance on duplicates."""
         merged: dict[str, dict] = {}
         for item in [*local, *web]:
-            website = (item.get("website") or "").strip().rstrip("/")
-            key = website.lower() if website else item.get("id") or item.get("name", "")
+            key = ProcurementAgent._supplier_identity_key(item)
             if not key:
                 key = str(len(merged))
             existing = merged.get(key)
+            # Directory profiles regularly use a different domain from the
+            # local company record. When their leading legal entity matches,
+            # merge the web evidence into the local supplier instead of
+            # showing the same company twice in the decision table.
+            if existing is None and ProcurementAgent._is_directory_supplier_profile(item):
+                entity_key = ProcurementAgent._supplier_entity_name_key(item)
+                if entity_key:
+                    for known_key, candidate in merged.items():
+                        if (
+                            candidate.get("source") in (None, "database")
+                            and ProcurementAgent._supplier_entity_name_key(candidate) == entity_key
+                        ):
+                            key = known_key
+                            existing = candidate
+                            break
             if existing is None:
                 merged[key] = item
+                continue
+            existing_is_local = existing.get("source") in (None, "database")
+            item_is_local = item.get("source") in (None, "database")
+            if existing_is_local != item_is_local:
+                local_item = dict(existing if existing_is_local else item)
+                web_item = item if existing_is_local else existing
+                # Keep the authoritative company record visibly local, while
+                # enriching it with contact/product evidence found online.
+                for field in (
+                    "website", "address", "phone", "email", "contactPerson", "description",
+                    "productName", "brand", "model", "specifications", "unitPriceEur",
+                    "quoteConditions", "deliveryDays", "deliveryLabel", "paymentTerm", "paymentLabel",
+                ):
+                    if not local_item.get(field) and web_item.get(field):
+                        local_item[field] = web_item[field]
+                for list_field in (
+                    "products", "capabilities", "certifications", "standards", "sourceUrls", "evidenceSnippets",
+                ):
+                    combined = [*(local_item.get(list_field) or []), *(web_item.get(list_field) or [])]
+                    local_item[list_field] = list(dict.fromkeys(str(value) for value in combined if value))
+                local_item["matchScore"] = max(
+                    int(local_item.get("matchScore", 0) or 0), int(web_item.get("matchScore", 0) or 0)
+                )
+                local_item["source"] = "database"
+                local_detail = local_item.get("sourceDetail") or "database"
+                local_item["sourceDetail"] = (
+                    local_detail if "web" in str(local_detail).casefold() else f"{local_detail}+web"
+                )
+                if web_item.get("verificationStatus") == "verified":
+                    local_item["verificationStatus"] = "verified"
+                merged[key] = local_item
                 continue
             # Prefer the entry with higher matchScore or more evidence
             existing_score = int(existing.get("matchScore", 0) or 0)
@@ -297,6 +686,63 @@ class ProcurementAgent:
                 merged[key] = item
         return list(merged.values())
 
+    @staticmethod
+    def _supplier_identity_key(item: dict) -> str:
+        website = str(item.get("website") or item.get("url") or "").strip()
+        if website:
+            parsed = urlparse(website if "://" in website else f"https://{website}")
+            host = (parsed.hostname or "").casefold().removeprefix("www.")
+            if host:
+                # Directory pages host many unrelated companies.  Keying only
+                # by the directory domain collapses all of them into one row.
+                # Real company sites still merge by domain so local + web
+                # enrichment continues to work as before.
+                directory_host = any(
+                    marker in host
+                    for marker in (
+                        "europages", "wlw.", "werliefertwas", "lieferanten.",
+                        "industrystock", "kompass", "supplier-directory",
+                    )
+                )
+                if not directory_host:
+                    return f"site:{host}"
+                name = re.sub(r"[^\w]+", "", str(item.get("name") or "").casefold())
+                return f"site:{host}|name:{name}" if name else f"site:{host}|url:{parsed.path.casefold()}"
+        name = re.sub(r"[^\w]+", "", str(item.get("name") or "").casefold())
+        return f"name:{name}" if name else ""
+
+    @staticmethod
+    def _is_directory_supplier_profile(item: dict) -> bool:
+        website = str(item.get("website") or item.get("url") or "").strip()
+        parsed = urlparse(website if "://" in website else f"https://{website}")
+        host = (parsed.hostname or "").casefold().removeprefix("www.")
+        return any(
+            marker in host
+            for marker in (
+                "europages", "wlw.", "werliefertwas", "lieferanten.",
+                "industrystock", "kompass", "directindustry",
+            )
+        )
+
+    @staticmethod
+    def _supplier_entity_name_key(item: dict) -> str:
+        """Return a cautious leading legal-entity key for directory enrichment."""
+
+        name = str(item.get("name") or "").casefold()
+        # Search-title suffixes (for example "in Heidelberg, ... auf
+        # europages") are descriptive, not part of the legal company name.
+        name = re.split(r"\b(?:in|auf|at|from|on)\b", name, maxsplit=1)[0]
+        ignored = {
+            "ag", "co", "company", "gmbh", "kg", "kgaa", "llc", "ltd",
+            "sarl", "spa", "bv", "inc", "und", "and", "the", "de", "der",
+        }
+        tokens = [
+            token
+            for token in re.findall(r"[a-z0-9äöüß]+", name)
+            if token not in ignored and len(token) >= 5
+        ]
+        return tokens[0] if tokens else ""
+
     async def search_quotes(
         self,
         query: str,
@@ -305,6 +751,8 @@ class ProcurementAgent:
         delivery_time: Optional[str] = None,
         weights: Optional[dict] = None,
         progress=None,
+        criteria: Optional[list[dict]] = None,
+        country: Optional[str] = None,
     ) -> dict:
         """Full pipeline for standard-product quote comparison.
 
@@ -316,6 +764,11 @@ class ProcurementAgent:
             progress("parse", "正在解析标准品比价需求，合并自然语言、前置过滤条件和权重偏好...", 10)
 
         intent = await self.parser.parse(query)
+        # The comparison form can supply a target market explicitly. Apply it
+        # before the marketplace stage so SerpApi receives the intended Google
+        # Shopping country even when natural-language parsing is ambiguous.
+        if country and country.strip():
+            intent.country = country.strip()
         max_delivery_days = self._delivery_time_to_days(delivery_time) or intent.max_delivery_days
         effective_max_price = max_price if max_price is not None else intent.max_price
         category = intent.category or "all standard products"
@@ -326,6 +779,8 @@ class ProcurementAgent:
                 f"；权重：价格 {weights.get('price', 40)}%、"
                 f"交付 {weights.get('delivery', 35)}%、评价 {weights.get('rating', 25)}%"
             )
+        if criteria:
+            weight_text += f"；自定义维度 {len(criteria)} 项"
 
         if progress:
             budget_detail = f"€{min_price or 0}–€{effective_max_price}" if effective_max_price else f"最低 €{min_price}" if min_price else "未设置预算"
@@ -342,7 +797,12 @@ class ProcurementAgent:
                 progress("parse", "正在将中文需求翻译为德语/英语关键词，以便匹配德文数据库和德国电商网站...", 21)
             german_kw = await self._llm_search_keywords_async(query)
             if german_kw:
-                german_phrase = german_kw
+                # LLM keyword cleanup can remove separators from exact models
+                # such as ``XC2011/01``. Keep those identifiers verbatim so
+                # marketplace APIs search the intended SKU/model, not merely
+                # the broad product category.
+                model_terms = self._quote_model_identifiers(query)
+                german_phrase = " ".join(dict.fromkeys([german_kw, *model_terms]))
                 # Inject German terms into intent.keywords so local DB filter can use them
                 de_terms = [t for t in german_kw.split() if len(t) >= 2]
                 intent.keywords = list(dict.fromkeys([*de_terms, *(intent.keywords or [])]))
@@ -352,11 +812,22 @@ class ProcurementAgent:
         if progress:
             progress("retrieve", "第一步先检索本地标准品/报价数据库，确认是否已有可比价商品...", 28)
 
+        # 本地候选：优先按 category 精确匹配，匹配不到则不过滤
         local_candidates = [
             {**quote, "source": quote.get("source", "database"), "sourceDetail": quote.get("sourceDetail", "database")}
             for quote in self.quotes
-            if intent.category is None or quote.get("category") == intent.category
+            if self._quote_has_decision_vendor(quote)
+            if intent.category is None
+            or not quote.get("category")
+            or quote.get("category") == intent.category
         ]
+        # 如果 category 精确匹配返回 0（如 DB 里是 "office" 但 parser 提取了 "paper"），
+        # 回退到不过滤 category，靠后续关键词和 _is_relevant_quote_item 来做相关性判断
+        if not local_candidates:
+            local_candidates = [
+                {**quote, "source": quote.get("source", "database"), "sourceDetail": quote.get("sourceDetail", "database")}
+                for quote in self.quotes
+            ]
         # When category is unknown, pre-filter by keyword to avoid flooding
         # the pipeline with 200+ irrelevant items (e.g., A4 paper when user
         # searches for "人体工学椅"). The full _is_relevant_quote_item check
@@ -376,17 +847,12 @@ class ProcurementAgent:
             quote for quote in local_candidates
             if self._is_relevant_quote_item(quote, query, intent)
         ]
-        # Sanity check: office supplies rarely exceed 200 EUR per unit
-        for quote in local_candidates:
-            if quote.get("unitPriceEur") is not None and quote["unitPriceEur"] > 200:
-                quote["unitPriceEur"] = None
-                quote["unitLabel"] = "需人工核价"
 
         if progress:
             progress("retrieve", f"本地标准品/报价库已检索完成：找到 {len(local_candidates)} 条本地候选，正在应用前置过滤条件...", 42)
 
         if progress:
-            progress("web", "第二步开始联网搜索 — 先查 idealo.de 比价平台，再补充搜索引擎...", 50)
+            progress("web", "第二步开始联网搜索 — 优先检查已配置的快速市场 API，再补充 Idealo 和搜索引擎...", 50)
         
         # ── Determine search phrase (reuse German translation if available) ──
         if german_phrase:
@@ -394,34 +860,169 @@ class ProcurementAgent:
         else:
             search_phrase = self._quote_search_product_phrase(query, intent)
         
-        # Phase A: idealo.de (German price comparison — high-quality structured data)
-        idealo_candidates = []
-        if progress:
-            progress("web", f"正在 idealo.de 搜索：「{search_phrase}」...", 52)
-        try:
-            idealo_candidates = await search_idealo(search_phrase, limit=4, timeout=35)
-        except Exception:
-            idealo_candidates = []
-        if progress and idealo_candidates:
-            progress("web", f"idealo.de 返回 {len(idealo_candidates)} 条比价候选（含商店/价格/评分）。", 55)
-        
-        # Phase B: DDG web search as fallback/supplement
-        web_candidates = await self._search_web_quotes(query, intent, max_results=8, progress=progress, pre_translated_phrase=search_phrase)
-        
-        # Merge: idealo first (higher quality), then web
-        web_candidates = self._merge_quote_candidates(idealo_candidates, web_candidates)
+        # Phase A: optional fast marketplace APIs. They are intentionally opt-in
+        # and can return stable, structured item prices without page scraping.
+        marketplace_candidates: list[dict] = []
+        marketplace_minimum = self._marketplace_short_circuit_minimum()
+        marketplace_search = getattr(self, "marketplace_search", None)
+        if marketplace_search is not None:
+            try:
+                if progress and getattr(marketplace_search, "enabled", True):
+                    progress(
+                        "web",
+                        "正在查询已配置的市场 API（仅纳入明确 EUR 价格；其他币种继续由 Idealo/网页来源补充，不自动换汇）...",
+                        51,
+                    )
+                marketplace_candidates = await marketplace_search.search(
+                    search_phrase,
+                    country=getattr(intent, "country", None),
+                    limit=8,
+                    min_priced_results=marketplace_minimum,
+                )
+                marketplace_candidates = [
+                    candidate
+                    for candidate in marketplace_candidates
+                    if self._is_relevant_quote_item(candidate, query, intent)
+                ]
+            except Exception:
+                marketplace_candidates = []
+
+        marketplace_priced = sum(
+            1 for candidate in marketplace_candidates if candidate.get("unitPriceEur") is not None
+        )
+        if marketplace_priced >= marketplace_minimum:
+            # The API has enough priced product candidates; avoid slower page
+            # scraping for this request. Relevance is checked again by the final
+            # LLM/rule filter before ranking.
+            web_candidates = marketplace_candidates
+            if progress:
+                progress(
+                    "web",
+                    f"市场 API 已返回 {marketplace_priced} 条带价候选，跳过本次 Idealo/网页抓取以缩短等待时间。",
+                    64,
+                )
+        else:
+            # API candidates remain usable even when they do not yet meet the
+            # desired comparison-table depth.  Supplement them for a bounded
+            # interval instead of allowing a slow crawler/LLM path to hold the
+            # whole request open indefinitely.
+            fallback_timeout = self._quote_web_fallback_timeout_seconds(
+                has_marketplace_prices=marketplace_priced > 0,
+            )
+            web_task = asyncio.create_task(
+                self._search_web_quotes(
+                    query,
+                    intent,
+                    max_results=8,
+                    progress=progress,
+                    pre_translated_phrase=search_phrase,
+                )
+            )
+            use_idealo = self._should_search_idealo_for_country(getattr(intent, "country", None))
+            if use_idealo:
+                if progress:
+                    progress("web", f"正在并行查询 idealo.de 和网页搜索：「{search_phrase}」...", 52)
+                # Idealo is a German price-comparison source. It is only used
+                # for Germany/default requests, never as a hidden substitute
+                # for a buyer-selected foreign market.
+                idealo_task = asyncio.create_task(
+                    search_idealo(search_phrase, limit=4, timeout=self._idealo_timeout_seconds())
+                )
+                try:
+                    idealo_result, web_result = await asyncio.wait_for(
+                        asyncio.gather(idealo_task, web_task, return_exceptions=True),
+                        timeout=fallback_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    idealo_task.cancel()
+                    web_task.cancel()
+                    await asyncio.gather(idealo_task, web_task, return_exceptions=True)
+                    idealo_result, web_result = [], []
+                    if progress:
+                        progress(
+                            "web",
+                            f"网页补充搜索超过 {fallback_timeout:.0f} 秒，已保留已验证的市场 API/本地报价继续生成比价表。",
+                            66,
+                        )
+                idealo_candidates = idealo_result if isinstance(idealo_result, list) else []
+            else:
+                market_label = self._quote_market_label(getattr(intent, "country", None))
+                if progress:
+                    progress(
+                        "web",
+                        f"目标市场「{market_label}」不使用德国 idealo.de，正在执行该市场的网页价格搜索...",
+                        52,
+                    )
+                try:
+                    web_result = await asyncio.wait_for(web_task, timeout=fallback_timeout)
+                except asyncio.TimeoutError:
+                    web_task.cancel()
+                    await asyncio.gather(web_task, return_exceptions=True)
+                    web_result = []
+                    if progress:
+                        progress(
+                            "web",
+                            f"网页补充搜索超过 {fallback_timeout:.0f} 秒，已保留已验证的市场 API/本地报价继续生成比价表。",
+                            66,
+                        )
+                idealo_candidates = []
+            searched_candidates = web_result if isinstance(web_result, list) else []
+            if progress and idealo_candidates:
+                progress("web", f"idealo.de 返回 {len(idealo_candidates)} 条比价候选（含商店/价格/评分）。", 55)
+            web_candidates = self._merge_quote_candidates(marketplace_candidates, idealo_candidates)
+            web_candidates = self._merge_quote_candidates(web_candidates, searched_candidates)
+
         if progress:
             price_known = sum(1 for item in web_candidates if item.get("unitPriceEur") is not None)
             progress("web", f"网络搜索完成：找到 {len(web_candidates)} 条网络候选，其中 {price_known} 条提取到明确价格，其余标记为需人工核价。", 64)
 
         all_candidates = self._merge_quote_candidates(local_candidates, web_candidates)
+        # Historical quote rows can contain the same marketplace seller again
+        # even after the live provider has collapsed its own response. Apply
+        # the seller-level collapse at the final boundary so the comparison
+        # table consistently stays one row per marketplace seller.
+        all_candidates = MarketplaceSearchLayer._collapse_duplicate_sellers(all_candidates)
         all_candidates = self._prefer_priced_quote_candidates(all_candidates)
 
-        if progress and len(all_candidates) > 0:
-            progress("web", f"正在用 LLM 对 {len(all_candidates)} 条候选做精准产品相关性判断（替代关键词匹配）...", 72)
-        all_candidates = await self._llm_filter_relevant_quotes(query, all_candidates, intent, german_search_terms=german_phrase)
-        if progress:
-            progress("web", f"LLM 相关性过滤完成：保留 {len(all_candidates)} 条真正匹配「{query}」的候选商品。", 78)
+        # A marketplace fast path has already passed the deterministic
+        # product-level gate above and carries explicit API price evidence.
+        # Avoid a second LLM round-trip here: it adds latency without adding
+        # material signal for structured product offers. Web/page fallbacks
+        # keep the LLM review because their snippets are much noisier.
+        if marketplace_priced >= marketplace_minimum:
+            all_candidates = [
+                candidate
+                for candidate in all_candidates
+                if self._is_relevant_quote_item(candidate, query, intent)
+            ]
+            if progress:
+                progress("web", f"市场 API 候选已通过产品匹配校验，跳过额外 LLM 复核并保留 {len(all_candidates)} 条。", 78)
+        else:
+            if progress and len(all_candidates) > 0:
+                progress("web", f"正在用 LLM 对 {len(all_candidates)} 条候选做精准产品相关性判断（替代关键词匹配）...", 72)
+            try:
+                all_candidates = await asyncio.wait_for(
+                    self._llm_filter_relevant_quotes(
+                        query,
+                        all_candidates,
+                        intent,
+                        german_search_terms=german_phrase,
+                    ),
+                    timeout=self._quote_llm_filter_timeout_seconds(),
+                )
+            except asyncio.TimeoutError:
+                # Deterministic product gates already ran before this optional
+                # semantic review.  Returning them is safer than losing a
+                # valid comparison table solely because the LLM was slow.
+                all_candidates = [
+                    candidate
+                    for candidate in all_candidates
+                    if self._is_relevant_quote_item(candidate, query, intent)
+                ]
+                if progress:
+                    progress("web", "语义复核超时，已按产品型号/品类的确定性规则保留有效候选。", 78)
+            if progress:
+                progress("web", f"LLM 相关性过滤完成：保留 {len(all_candidates)} 条真正匹配「{query}」的候选商品。", 78)
 
         ranked = await self.ranker.rank_quotes(
             query,
@@ -430,6 +1031,7 @@ class ProcurementAgent:
             max_price=effective_max_price,
             max_delivery_days=max_delivery_days,
             weights=weights,
+            criteria=criteria,
         )
 
         # Fallback: if ranker eliminated everything, return LLM-filtered candidates unsorted
@@ -449,7 +1051,9 @@ class ProcurementAgent:
         if progress:
             progress("rank", f"标准品比价完成！共 {len(ranked)} 条候选，当前推荐：{top}。", 95)
 
-        return {"intent": intent.model_dump(), "results": ranked}
+        intent_payload = intent.model_dump()
+        intent_payload["appliedCriteria"] = criteria or []
+        return {"intent": intent_payload, "results": ranked}
 
     async def _search_web_quotes(self, query: str, intent, max_results: int = 8, progress=None, pre_translated_phrase: str = "") -> list[dict]:
         """Search the public web for quote/product candidates and extract real prices.
@@ -474,10 +1078,11 @@ class ProcurementAgent:
                     if progress:
                         progress("web", f"LLM 将需求翻译为德语搜索词：「{product_phrase}」。", 51)
         candidates: list[dict] = []
+        market_label = self._quote_market_label(getattr(intent, "country", None))
         if progress:
             progress(
                 "web",
-                f"Agent 将本次需求转成可搜索的商品短语：「{product_phrase}」，准备优先查德国办公用品电商的商品页和价格片段。",
+                f"Agent 将本次需求转成可搜索的商品短语：「{product_phrase}」，准备优先查目标市场「{market_label}」的商品页和价格片段。",
                 52,
             )
 
@@ -488,8 +1093,10 @@ class ProcurementAgent:
             except Exception:
                 return q, []
 
-        # Phase 1: parallel site-specific searches on known German shops
-        site_queries = self._quote_site_specific_queries(product_phrase)
+        # Phase 1: use German retailers only for Germany/default requests.
+        # Other target markets receive country-qualified generic queries, so a
+        # selection such as Poland cannot silently become a German web search.
+        site_queries = self._quote_site_specific_queries(product_phrase, getattr(intent, "country", None))
         if progress:
             progress("web", f"并行启动 {len(site_queries)} 条网站搜索 + 价格搜索，每批 3 条并发，大幅缩短等待时间。", 53)
 
@@ -523,7 +1130,7 @@ class ProcurementAgent:
             extra_queries = self._quote_price_search_queries(query, intent)
             seen_urls = {url for item in candidates for url in item.get("sourceUrls", [])}
             if progress:
-                progress("web", "可用价格还不够，Agent 正在追加偏价格意图搜索词（Preis / kaufen / online bestellen）来补价。", 63)
+                progress("web", f"可用价格还不够，Agent 正在追加目标市场「{market_label}」的价格搜索词来补价。", 63)
             extra_batch = extra_queries[:2]
             extra_results_list = await asyncio.gather(*(_search_one(q) for q in extra_batch))
             for extra_query, extra_results in extra_results_list:
@@ -537,8 +1144,17 @@ class ProcurementAgent:
                     break
         return candidates
     @classmethod
-    def _quote_site_specific_queries(cls, product_phrase: str) -> list[str]:
-        """Return queries targeting German e-commerce sites with prices."""
+    def _quote_site_specific_queries(cls, product_phrase: str, country: str | None = None) -> list[str]:
+        """Return country-correct price-search queries for the selected market."""
+        if not cls._should_search_idealo_for_country(country):
+            market_label = cls._quote_market_label(country)
+            return [
+                f"{product_phrase} price {market_label}",
+                f"{product_phrase} buy online {market_label}",
+                f"{product_phrase} supplier price {market_label}",
+                f"{product_phrase} EUR price {market_label}",
+            ]
+
         # Detect if this is likely non-office (appliance, electronics, furniture)
         non_office_signals = ['kaffee', 'maschine', 'vollautomat', 'küche', 'herd', 
                               'kühlschrank', 'wasch', 'trockner', 'fernseher', 'staubsauger',
@@ -557,11 +1173,11 @@ class ProcurementAgent:
         industrial_signals = ("festo", "steckanschluss", "anschluss", "pneumatik", "qs", "verschraubung")
         if any(signal in lower_phrase for signal in industrial_signals):
             queries = [
-                f"site:festo.com/de/de {product_phrase}",
-                f"site:automation24.de {product_phrase}",
-                f"site:de.rs-online.com {product_phrase}",
-                f"site:conrad.de {product_phrase}",
-                f"site:voelkner.de {product_phrase}",
+                f"{product_phrase} festo.com kaufen",
+                f"{product_phrase} automation24.de Preis",
+                f"{product_phrase} rs-online.com bestellen",
+                f"{product_phrase} conrad.de kaufen",
+                f"{product_phrase} voelkner.de Preis",
                 f"{product_phrase} kaufen Preis EUR",
             ]
         elif is_non_office:
@@ -569,20 +1185,21 @@ class ProcurementAgent:
             queries = [
                 f"{product_phrase} kaufen Preis EUR",
                 f"{product_phrase} online shop Deutschland",
-                f"site:idealo.de {product_phrase}",
-                f"site:notebooksbilliger.de {product_phrase}",
-                f"site:cyberport.de {product_phrase}",
-                f"site:alternate.de {product_phrase}",
-                f"site:mediamarkt.de {product_phrase}",
-                f"site:saturn.de {product_phrase}",
-                f"site:amazon.de {product_phrase}",
+                f"{product_phrase} idealo.de Preis",
+                f"{product_phrase} notebooksbilliger.de kaufen",
+                f"{product_phrase} cyberport.de Preis",
+                f"{product_phrase} alternate.de bestellen",
+                f"{product_phrase} mediamarkt.de Preis",
+                f"{product_phrase} saturn.de kaufen",
+                f"{product_phrase} amazon.de Preis EUR",
             ]
         else:
             queries = [
-                f"site:bueromarkt-ag.de {product_phrase}",
-                f"site:schaefer-shop.de {product_phrase}",
-                f"site:viking.de {product_phrase}",
-                f"site:amazon.de {product_phrase}",
+                f"{product_phrase} idealo.de Preis",
+                f"{product_phrase} bueromarkt-ag.de kaufen",
+                f"{product_phrase} schaefer-shop.de Preis",
+                f"{product_phrase} viking.de bestellen",
+                f"{product_phrase} amazon.de Preis EUR",
                 f"{product_phrase} kaufen Preis EUR",
                 f"{product_phrase} günstig bestellen",
             ]
@@ -681,11 +1298,41 @@ class ProcurementAgent:
                     progress("web", f"商品页未返回可读正文，可能被验证码/反爬拦截：{host}。", 67)
             except Exception:
                 evidence_text = ""
+        # An LLM cannot serve as price evidence.  Keep this optional legacy
+        # assist disabled by default, and never let a synchronous HTTP request
+        # block FastAPI's event loop while a comparison job is running.
+        if (
+            price is None
+            and evidence_text
+            and os.getenv("ENABLE_LLM_PRICE_EXTRACTION", "").strip().casefold() in {"1", "true", "yes"}
+            and os.getenv("OPENAI_API_KEY")
+        ):
+            try:
+                import httpx
+                dk_url = self._deepseek_chat_completions_url()
+                headers = {
+                    "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "model": os.getenv("LLM_MODEL", "deepseek-v4-flash"),
+                    "messages": [
+                        {"role": "user", "content": f"Product: {title}.\\nPage text: {evidence_text[:2000]}.\\n\\nWhat is the unit price in EUR? Reply ONLY with the number, e.g. 12.99"}
+                    ],
+                    "temperature": 0,
+                }
+                timeout = self._llm_price_extraction_timeout_seconds()
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(dk_url, json=payload, headers=headers)
+                if resp.status_code == 200:
+                    raw = resp.json()["choices"][0]["message"]["content"].strip()
+                    price = self._extract_eur_price(raw)
+                    if price and progress:
+                        progress("web", f"DeepSeek 提取到价格：{title[:30]} → €{price:.2f}", 67)
+            except Exception:
+                pass
         if not self._is_relevant_quote_result(f"{text} {evidence_text}", query, intent, price_found=price is not None):
             return None
-        # Sanity check: office supplies rarely exceed 200 EUR per unit
-        if price is not None and price > 200:
-            price = None
         vendor = self._vendor_from_host(host)
         category = intent.category or "web"
         return {
@@ -712,15 +1359,104 @@ class ProcurementAgent:
             "priceConfidence": "extracted" if price is not None else "unknown",
         }
 
+    @staticmethod
+    def _deepseek_chat_completions_url() -> str:
+        """Build OpenAI-compatible chat completions URL from OPENAI_BASE_URL.
+
+        The Desktop launcher sets OPENAI_BASE_URL=https://api.deepseek.com.
+        Posting to that root returns 404; price lookup must call /chat/completions.
+        """
+        base = (os.getenv("OPENAI_BASE_URL") or "https://api.deepseek.com").rstrip("/")
+        if base.endswith("/chat/completions"):
+            return base
+        if base.endswith("/v1"):
+            return f"{base}/chat/completions"
+        return f"{base}/chat/completions"
+
+    @staticmethod
+    def _idealo_timeout_seconds() -> float:
+        """Bound direct Idealo result-page lookup while keeping an override."""
+        try:
+            configured = float(os.getenv("IDEALO_TIMEOUT_SECONDS", "20"))
+        except (TypeError, ValueError):
+            configured = 20.0
+        return min(45.0, max(10.0, configured))
+
+    @staticmethod
+    def _quote_web_fallback_timeout_seconds(*, has_marketplace_prices: bool) -> float:
+        """Cap slow supplementary web research without discarding API offers."""
+        default = "22" if has_marketplace_prices else "35"
+        try:
+            configured = float(os.getenv("QUOTE_WEB_FALLBACK_TIMEOUT_SECONDS", default))
+        except (TypeError, ValueError):
+            configured = float(default)
+        return min(60.0, max(8.0, configured))
+
+    @staticmethod
+    def _quote_llm_filter_timeout_seconds() -> float:
+        try:
+            configured = float(os.getenv("QUOTE_LLM_FILTER_TIMEOUT_SECONDS", "12"))
+        except (TypeError, ValueError):
+            configured = 12.0
+        return min(30.0, max(3.0, configured))
+
+    @staticmethod
+    def _llm_price_extraction_timeout_seconds() -> float:
+        try:
+            configured = float(os.getenv("LLM_PRICE_EXTRACTION_TIMEOUT_SECONDS", "5"))
+        except (TypeError, ValueError):
+            configured = 5.0
+        return min(15.0, max(1.0, configured))
+
+    @staticmethod
+    def _marketplace_short_circuit_minimum() -> int:
+        """Number of priced API candidates required before skipping page scraping."""
+        try:
+            configured = int(os.getenv("MARKETPLACE_PRICED_SHORT_CIRCUIT_MIN", "3"))
+        except (TypeError, ValueError):
+            configured = 3
+        return min(8, max(1, configured))
+
+    @staticmethod
+    def _quote_market_scope(country: str | None) -> str:
+        """Classify a requested market without treating it as Germany by default."""
+
+        raw = str(country or "").strip().casefold()
+        if not raw or raw in {"de", "germany", "deutschland"}:
+            return "germany"
+        if raw in {"eu", "europe", "european union", "欧洲", "欧盟", "欧洲联盟"}:
+            return "aggregate"
+        return "country"
+
+    @classmethod
+    def _should_search_idealo_for_country(cls, country: str | None) -> bool:
+        """Idealo is a Germany-only supplement for comparison requests."""
+
+        return cls._quote_market_scope(country) == "germany"
+
+    @classmethod
+    def _quote_market_label(cls, country: str | None) -> str:
+        if cls._quote_market_scope(country) == "germany":
+            return "Germany"
+        return str(country or "Europe").strip() or "Europe"
+
     @classmethod
     def _quote_price_search_queries(cls, query: str, intent) -> list[str]:
         terms = cls._quote_search_product_phrase(query, intent)
-        country = getattr(intent, "country", None) or "Germany"
+        country = getattr(intent, "country", None)
+        market_label = cls._quote_market_label(country)
+        if not cls._should_search_idealo_for_country(country):
+            return [
+                f"{terms} price {market_label}",
+                f"{terms} buy online {market_label}",
+                f"{terms} supplier price {market_label}",
+                f"{terms} EUR price {market_label}",
+            ]
         return [
             f"{terms} Preis €",
             f"{terms} günstig kaufen",
             f"{terms} online bestellen Preis",
-            f"{terms} shop {country}",
+            f"{terms} shop Germany",
         ]
 
     @classmethod
@@ -757,6 +1493,25 @@ class ProcurementAgent:
                         extras.append("usb-c" if marker == "usbc" else marker)
                 if extras:
                     phrase = " ".join([*extras, phrase])
+            # Google Shopping needs the requested SKU/model in the query.  A
+            # product-family-only query such as "maus" can return a full page
+            # of unrelated mice even though a precise model was supplied.
+            identifiers = cls._quote_model_identifiers(query)
+            brands = cls._quote_brand_terms(query)
+            qualifiers = [*brands, *identifiers]
+            if qualifiers:
+                # Search engines treat ``B100`` and ``b100`` identically, but
+                # Python's normal dictionary de-duplication does not.  Keep
+                # the buyer's original model spelling once while avoiding a
+                # redundant term that can dilute a compact Shopping query.
+                words: list[str] = []
+                seen_words: set[str] = set()
+                for word in [*qualifiers, *phrase.split()]:
+                    normalized = word.casefold()
+                    if normalized and normalized not in seen_words:
+                        words.append(word)
+                        seen_words.add(normalized)
+                phrase = " ".join(words)
             return phrase
         # No known product group matched — strip constraint words, keep product nouns
         terms = sorted(cls._quote_relevance_terms(query, intent), key=len, reverse=True)
@@ -788,6 +1543,37 @@ class ProcurementAgent:
             return cleaned.strip()
         except Exception:
             return ""
+
+    @staticmethod
+    def _quote_model_identifiers(query: str) -> list[str]:
+        """Return concrete SKU/model tokens that must survive search rewriting."""
+        values: list[str] = []
+        pattern = r"(?<![A-Za-z0-9])(?=[A-Za-z0-9/-]*[A-Za-z])(?=[A-Za-z0-9/-]*\d)[A-Za-z0-9]+(?:[/-][A-Za-z0-9]+)*(?![A-Za-z0-9])"
+        generic_tokens = {"a3", "a4", "a5", "s1", "s2", "s3", "s4", "80g", "75g", "90g"}
+        for raw in re.findall(pattern, query or ""):
+            value = raw.strip()
+            if len(value) >= 3 and value.casefold() not in generic_tokens and value not in values:
+                values.append(value)
+        return values[:4]
+
+    @staticmethod
+    def _quote_brand_terms(query: str) -> list[str]:
+        """Keep explicit common brands in marketplace requests when present."""
+        text = str(query or "")
+        lowered = text.casefold()
+        values: list[str] = []
+        for match in re.finditer(r"(?:brand|marke|品牌)\s*:\s*([A-Za-z0-9][A-Za-z0-9._-]{1,40})", text, re.IGNORECASE):
+            value = match.group(1).strip()
+            if value and value.casefold() not in {item.casefold() for item in values}:
+                values.append(value)
+        for brand in (
+            "logitech", "lenovo", "dell", "hp", "apple", "samsung", "philips",
+            "festo", "sika", "teroson", "henkel", "uvex", "tesa", "canon",
+        ):
+            if re.search(rf"(?<![a-z0-9]){re.escape(brand)}(?![a-z0-9])", lowered):
+                if brand not in {item.casefold() for item in values}:
+                    values.append(brand)
+        return values[:2]
 
     @staticmethod
     def _strip_constraint_words(text: str) -> str:
@@ -1027,6 +1813,14 @@ class ProcurementAgent:
         add_if(("festo",), {"festo"})
         add_if(("qs",), {"qs"})
         add_if(("工作站", "workstation", "zbook", "desktop"), {"工作站", "workstation", "zbook", "desktop", "arbeitsstation"})
+        # A model/SKU is an explicit buyer constraint, not merely a ranking
+        # preference.  Require it alongside the product-family group so a
+        # search for "Logitech B100 mouse" cannot recommend an unrelated
+        # gaming mouse just because both are mice.
+        for identifier in cls._quote_model_identifiers(query):
+            aliases = {identifier.casefold()}
+            if not any(aliases == existing for existing in groups):
+                groups.append(aliases)
         return groups
 
     @classmethod
@@ -1042,9 +1836,26 @@ class ProcurementAgent:
             if value
         )
         url = (quote.get("sourceUrls") or [""])[0]
-        if cls._is_non_product_quote_page(str(quote.get("product") or ""), str(quote.get("description") or ""), url, intent):
+        # Marketplace APIs return an individual product record. Its URL can be
+        # on a domain intentionally blocked from generic crawler results, but it
+        # still needs ordinary product relevance validation.
+        is_marketplace_item = str(quote.get("sourceDetail") or "").startswith("marketplace:")
+        if not is_marketplace_item and cls._is_non_product_quote_page(
+            str(quote.get("product") or ""),
+            str(quote.get("description") or ""),
+            url,
+            intent,
+        ):
             return False
         return cls._is_relevant_quote_result(text, query, intent, price_found=quote.get("unitPriceEur") is not None)
+
+    @staticmethod
+    def _quote_has_decision_vendor(quote: dict) -> bool:
+        """Do not rank orphaned local quotes as if they were suppliers."""
+        vendor = str(quote.get("vendor") or "").strip().casefold()
+        if vendor in {"", "unknown", "n/a", "none", "null"}:
+            return False
+        return True
 
 
     async def _llm_filter_relevant_quotes(self, query: str, candidates: list[dict], intent, german_search_terms: str = "") -> list[dict]:
@@ -1133,9 +1944,10 @@ class ProcurementAgent:
     @classmethod
     def _extract_eur_price(cls, text: str) -> float | None:
         patterns = [
-            r'"price"\s*:\s*"?([0-9][0-9.,]*(?:[.,][0-9]{2})?)"?[^{}]{0,160}"priceCurrency"\s*:\s*"?EUR"?',
-            r'"priceCurrency"\s*:\s*"?EUR"?[^{}]{0,160}"price"\s*:\s*"?([0-9][0-9.,]*(?:[.,][0-9]{2})?)"?',
+            r'"(?:price|lowPrice)"\s*:\s*"?([0-9][0-9.,]*(?:[.,][0-9]{2})?)"?[^{}]{0,160}"priceCurrency"\s*:\s*"?EUR"?',
+            r'"priceCurrency"\s*:\s*"?EUR"?[^{}]{0,160}"(?:price|lowPrice)"\s*:\s*"?([0-9][0-9.,]*(?:[.,][0-9]{2})?)"?',
             r'(?:data-price|content|amount)\s*=\s*["\']([0-9][0-9.,]*(?:[.,][0-9]{2})?)["\'][^<>]{0,120}(?:EUR|€)',
+            r'(?:EUR|Euro)\s*([0-9][0-9.,]*(?:[.,][0-9]{2})?)',
             r"€\s*([0-9][0-9.,]*(?:[.,][0-9]{2})?)",
             r"€\s*([0-9][0-9.,]*)\s*(?:[-–]|,–)",
             r"([0-9][0-9.,]*(?:[.,][0-9]{2})?)\s*(?:EUR|Euro|€)",
@@ -1175,6 +1987,10 @@ class ProcurementAgent:
                 value = "".join(parts[:-1]) + "." + parts[-1]
             elif len(parts) > 2:
                 value = "".join(parts)
+            elif len(parts) == 2 and len(parts[-1]) == 3:
+                # German prices often use a single dot as the thousands
+                # separator, e.g. € 1.234 for € 1,234.
+                value = "".join(parts)
         try:
             return float(value)
         except ValueError:
@@ -1194,15 +2010,38 @@ class ProcurementAgent:
         return base.replace("-", " ").replace("_", " ").title() or host
 
     @staticmethod
-    def _merge_quote_candidates(local_candidates: list[dict], web_candidates: list[dict]) -> list[dict]:
+    def _quote_identity_key(item: dict) -> str:
+        """Build a stable offer key that removes repeated DB imports.
+
+        Quote IDs and tracking URLs are often unique per crawl even when the
+        vendor, product and platform are identical.  Those rows add noise to
+        the comparison table without adding a new purchasing option.  Web
+        listing rows keep their item IDs because each card can be a distinct
+        offer; database rows use the normalized commercial identity instead.
+        """
+        source = str(item.get("source") or "web").casefold()
+        detail = str(item.get("sourceDetail") or "").casefold()
+        if source == "database" or detail == "database":
+            def _norm(value: object) -> str:
+                return re.sub(r"[^a-z0-9äöüß]+", "", str(value or "").casefold())
+
+            vendor = _norm(item.get("vendor"))
+            product = _norm(item.get("product"))
+            platform = _norm(item.get("platform"))
+            if vendor or product or platform:
+                return f"database:{vendor}|{product}|{platform}"
+        if detail == "listing":
+            return f"listing:{item.get('id') or ''}"
+        urls = item.get("sourceUrls") or []
+        if urls:
+            return f"web-url:{str(urls[0]).split('#', 1)[0]}"
+        return f"web-id:{item.get('id') or item.get('vendor') or len(str(item))}"
+
+    @classmethod
+    def _merge_quote_candidates(cls, local_candidates: list[dict], web_candidates: list[dict]) -> list[dict]:
         merged: dict[str, dict] = {}
         for item in [*local_candidates, *web_candidates]:
-            urls = item.get("sourceUrls") or []
-            # Listing page products each have a unique product link; use ID as key
-            if item.get("sourceDetail") == "listing":
-                key = item.get("id", str(len(merged)))
-            else:
-                key = str(urls[0] if urls else item.get("id") or item.get("vendor") or len(merged))
+            key = cls._quote_identity_key(item)
             existing = merged.get(key)
             if existing is None:
                 merged[key] = item
@@ -1217,13 +2056,10 @@ class ProcurementAgent:
 
     @staticmethod
     def _prefer_priced_quote_candidates(candidates: list[dict]) -> list[dict]:
-        """Avoid a deliverable table full of '需人工核价' when priced rows exist.
-        Keep listing products (from verified product pages) even without price."""
-        listing_items = [item for item in candidates if item.get("sourceDetail") == "listing"]
-        other_items = [item for item in candidates if item.get("sourceDetail") != "listing"]
-        priced_other = [item for item in other_items if item.get("unitPriceEur") is not None]
-        if priced_other:
-            return priced_other + listing_items
+        """Hide manual-price rows when at least one published offer exists."""
+        priced = [item for item in candidates if item.get("unitPriceEur") is not None]
+        if priced:
+            return priced
         return candidates
 
     @staticmethod
@@ -1234,7 +2070,7 @@ class ProcurementAgent:
     @staticmethod
     def _create_llm():
         api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key or api_key == "sk-your-key-here":
+        if not api_key:
             return None
         try:
             from langchain_openai import ChatOpenAI

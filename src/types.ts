@@ -68,13 +68,86 @@ export interface Supplier {
   sourceUrls?: string[]
   /** Short text snippets supporting the extracted supplier profile. */
   evidenceSnippets?: string[]
+  /** Product evidence extracted from supplier pages or local purchase records. */
+  productName?: string
+  brand?: string
+  model?: string
+  specifications?: string
+  standards?: string[]
+  /** Commercial details are optional because many web listings omit them. */
+  unitPrice?: number | null
+  currency?: string
+  quoteConditions?: string
+  deliveryLeadTime?: string
+  paymentTerms?: string
+  /** Per-criterion evidence scores returned by the sourcing agent. */
+  criteriaScores?: Record<string, number>
+  weightedCriteriaScore?: number
+  appliedCriteria?: EvaluationCriterion[]
+  /** Whether the profile has a contact method and product evidence to verify. */
+  verificationStatus?: 'verified' | 'partial' | 'unverified' | string
+  dataCompleteness?: number
   /** 0–100 relevance to the query. */
   matchScore: number
 }
 
+/** A user-defined sourcing decision dimension and its relative importance. */
+export interface EvaluationCriterion {
+  key: string
+  label: string
+  weight: number
+}
+
+/**
+ * A reusable local supplier record. Unlike a search result, it does not need a
+ * relevance score and can be curated by the procurement team over time.
+ */
+export interface SupplierDirectoryEntry {
+  id: string
+  name: string
+  country?: string
+  city?: string
+  address?: string
+  contactPerson?: string
+  phone?: string
+  email?: string
+  website?: string
+  capabilities?: string[]
+  certifications?: string[]
+  tags: string[]
+  notes?: string
+  /** Backend provenance of the record; manually curated entries are internal. */
+  origin?: 'internal' | 'web' | string
+  source?: 'local' | 'database' | string
+  preferred?: boolean
+  historicalPerformance?: string | number | boolean
+  minimumOrderQuantity?: string
+  productionCapacity?: string
+  environmentalStandards?: string[]
+  criteriaScores?: Record<string, number>
+  productName?: string
+  brand?: string
+  model?: string
+  specifications?: string
+  standards?: string[]
+  unitPriceEur?: number | null
+  quoteConditions?: string
+  deliveryDays?: number | null
+  deliveryLabel?: string
+  paymentTerm?: string
+  paymentLabel?: string
+  createdAt?: number
+  updatedAt: number
+}
+
+export type SupplierDirectoryInput = Omit<
+  SupplierDirectoryEntry,
+  'id' | 'createdAt' | 'updatedAt'
+>
+
 // --- Comparison (standard-product price benchmarking) ----------------------
 
-export type PaymentTermKey = 'onAccount' | 'prepayment' | 'card'
+export type PaymentTermKey = 'onAccount' | 'prepayment' | 'card' | 'unknown'
 
 export interface ComparisonItem {
   id: string
@@ -99,6 +172,10 @@ export interface ComparisonItem {
   sourceUrls?: string[]
   evidenceSnippets?: string[]
   priceConfidence?: 'extracted' | 'unknown' | string
+  /** Per-criterion evidence scores returned when custom comparison criteria are used. */
+  criteriaScores?: Record<string, number>
+  weightedCriteriaScore?: number
+  appliedCriteria?: EvaluationCriterion[]
 }
 
 export type DeliveryOptionKey = 'unlimited' | 'within3' | 'within7'
@@ -141,6 +218,8 @@ export interface ConversationRestore {
   minPrice?: string
   maxPrice?: string
   deliveryTime?: DeliveryOptionKey
+  /** Explicit target market for a standard-product comparison. */
+  comparisonCountry?: string
   weights?: FactorWeights
   /** Structured fields for sourcing module reopen. */
   productName?: string
@@ -148,9 +227,13 @@ export interface ConversationRestore {
   unit?: string
   brand?: string
   model?: string
+  specifications?: string
+  standards?: string
   structuredCategory?: string
   structuredCountry?: string
   structuredCerts?: string
+  sourcingCriteria?: EvaluationCriterion[]
+  comparisonCriteria?: EvaluationCriterion[]
 }
 
 /** One logged query + everything the user typed for it. */

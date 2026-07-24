@@ -22,11 +22,29 @@ class LLMRanker:
         self.llm = llm
         self.optimized_prompt_path = Path(__file__).resolve().parents[1] / "data" / "optimized_prompt.txt"
 
-    async def rank_suppliers(self, query: str, candidates: list[dict]) -> list[dict]:
-        """Score each candidate 0-100 based on query relevance. Return sorted by matchScore with reasons."""
+    async def rank_suppliers(
+        self,
+        query: str,
+        candidates: list[dict],
+        criteria: list[dict] | None = None,
+    ) -> list[dict]:
+        """Rank suppliers by relevance plus optional user-defined criteria.
+
+        Criteria are intentionally open-ended rather than a fixed price / lead
+        time / payment triad.  A supplier record can provide a ``criteriaScores``
+        map for company-specific dimensions, while commonly used dimensions
+        (certifications, environmental standards, capacity, incumbent status,
+        etc.) have conservative evidence-based fallbacks.
+        """
         if not candidates:
             return []
-        llm_scores = await self._rank_with_llm(query, candidates, "supplier")
+        normalized_criteria = self._normalize_supplier_criteria(criteria)
+        llm_scores = await self._rank_with_llm(
+            query,
+            candidates,
+            "supplier",
+            weights={"criteria": normalized_criteria} if normalized_criteria else None,
+        )
         ranked = []
         for candidate in candidates:
             scored = dict(candidate)
@@ -38,6 +56,18 @@ class LLMRanker:
                 scored["matchScore"] = self._heuristic_score(query, candidate)
                 scored["reason"] = self._supplier_reason(query, candidate)
             scored["matchScore"] = self._apply_repurchase_bonus(scored)
+            if normalized_criteria:
+                criteria_score, evidence_scores = self._supplier_weighted_criteria_score(
+                    scored, normalized_criteria
+                )
+                # Relevance remains the dominant guardrail, while the user can
+                # materially shift a close decision with their own dimensions.
+                scored["matchScore"] = max(
+                    0, min(100, round(scored["matchScore"] * 0.65 + criteria_score * 0.35))
+                )
+                scored["criteriaScores"] = evidence_scores
+                scored["weightedCriteriaScore"] = criteria_score
+                scored["appliedCriteria"] = normalized_criteria
             ranked.append(scored)
         return sorted(ranked, key=lambda item: item.get("matchScore", 0), reverse=True)
 
@@ -49,8 +79,9 @@ class LLMRanker:
         max_price: float = None,
         max_delivery_days: int = None,
         weights: dict | None = None,
+        criteria: list[dict] | None = None,
     ) -> list[dict]:
-        """Score quotes, apply hard filters, and sort by the user's decision weights."""
+        """Score quotes with core weights and optional custom decision criteria."""
         filtered = []
         for candidate in candidates:
             unit_price = candidate.get("unitPriceEur")
@@ -67,8 +98,14 @@ class LLMRanker:
             return []
 
         normalized_weights = self._normalize_quote_weights(weights)
+        normalized_criteria = self._normalize_supplier_criteria(criteria)
         quote_stats = self._quote_normalization_stats(filtered)
-        llm_scores = await self._rank_with_llm(query, filtered, "quote", weights=normalized_weights)
+        llm_scores = await self._rank_with_llm(
+            query,
+            filtered,
+            "quote",
+            weights={"core": normalized_weights, "criteria": normalized_criteria} if normalized_criteria else normalized_weights,
+        )
         ranked = []
         for candidate in filtered:
             scored = dict(candidate)
@@ -81,6 +118,16 @@ class LLMRanker:
             else:
                 scored["matchScore"] = weighted_score
                 scored["reason"] = self._quote_reason(candidate)
+            if normalized_criteria:
+                criteria_score, evidence_scores = self._supplier_weighted_criteria_score(
+                    scored, normalized_criteria
+                )
+                scored["matchScore"] = max(
+                    0, min(100, round(scored["matchScore"] * 0.65 + criteria_score * 0.35))
+                )
+                scored["criteriaScores"] = evidence_scores
+                scored["weightedCriteriaScore"] = criteria_score
+                scored["appliedCriteria"] = normalized_criteria
             ranked.append(scored)
         return sorted(ranked, key=lambda item: item.get("matchScore", 0), reverse=True)
 
@@ -117,12 +164,21 @@ class LLMRanker:
                 except Exception:
                     pass
 
+            criteria_instruction = ""
+            if item_type == "supplier" and weights:
+                criteria_instruction = (
+                    "For suppliers, also respect these user-defined evaluation criteria "
+                    f"and their relative weights: {weights}. "
+                )
+            elif item_type == "quote" and weights:
+                criteria_instruction = f"For quote comparisons, respect these decision weights: {weights}. "
+
             prompt = (
                 f"{system_instruction}"
                 f"Rank these procurement {item_type} candidates for the query. "
                 "Return one result per candidate id with matchScore 0-100 and a concise reason. "
                 "For suppliers, candidates with source=database / repurchasePriority=database are existing database suppliers and should receive a modest repurchase preference when relevance is close; do not let this override a clearly much better new web supplier. "
-                f"For quote comparisons, respect these decision weights when provided: {weights}. "
+                f"{criteria_instruction}"
                 f"Query: {query}\nCandidates: {payload}"
             )
             structured_llm = self.llm.with_structured_output(RankingResponse, method="function_calling")
@@ -213,6 +269,112 @@ class LLMRanker:
         }
 
     @staticmethod
+    def _normalize_supplier_criteria(criteria: list[dict] | None) -> list[dict]:
+        """Validate, deduplicate and normalize arbitrary supplier criteria."""
+        merged: dict[str, dict] = {}
+        for raw in criteria or []:
+            if not isinstance(raw, dict):
+                continue
+            key = str(raw.get("key") or "").strip()
+            if not key:
+                continue
+            try:
+                weight = max(0.0, float(raw.get("weight", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+            normalized_key = key.casefold()
+            current = merged.get(normalized_key)
+            if current is None:
+                merged[normalized_key] = {
+                    "key": key,
+                    "label": str(raw.get("label") or key),
+                    "weight": weight,
+                }
+            else:
+                current["weight"] += weight
+        total = sum(item["weight"] for item in merged.values())
+        if total <= 0:
+            return []
+        return [
+            {**item, "weight": round(item["weight"] / total * 100, 2)}
+            for item in merged.values()
+            if item["weight"] > 0
+        ]
+
+    @classmethod
+    def _supplier_weighted_criteria_score(
+        cls, candidate: dict, criteria: list[dict]
+    ) -> tuple[float, dict[str, float]]:
+        scores: dict[str, float] = {}
+        weighted = 0.0
+        for criterion in criteria:
+            key = str(criterion["key"])
+            score = cls._supplier_criterion_score(candidate, key, str(criterion.get("label") or ""))
+            scores[key] = score
+            weighted += score * float(criterion["weight"])
+        return round(weighted / 100, 2), scores
+
+    @staticmethod
+    def _supplier_criterion_score(candidate: dict, key: str, label: str = "") -> float:
+        """Resolve a 0–100 score from stored evidence without inventing facts."""
+        canonical = re.sub(r"[\W_]", "", key.casefold())
+        label_token = re.sub(r"[\W_]", "", label.casefold())
+        searchable = f"{canonical} {label_token}"
+
+        def matches(*aliases: str) -> bool:
+            return any(alias.casefold() in searchable for alias in aliases)
+
+        supplied = candidate.get("criteriaScores") or {}
+        if isinstance(supplied, dict):
+            for supplied_key, supplied_score in supplied.items():
+                supplied_token = re.sub(r"[\W_]", "", str(supplied_key).casefold())
+                if supplied_token not in {canonical, label_token}:
+                    continue
+                try:
+                    return max(0.0, min(100.0, float(supplied_score)))
+                except (TypeError, ValueError):
+                    break
+
+        rating = candidate.get("rating")
+        try:
+            rating_score = float(rating)
+            rating_score = rating_score * 20 if rating_score <= 5 else rating_score
+            rating_score = max(0.0, min(100.0, rating_score))
+        except (TypeError, ValueError):
+            rating_score = 50.0
+        certifications = [str(item).casefold() for item in candidate.get("certifications", [])]
+        environment = [
+            *certifications,
+            *(str(item).casefold() for item in candidate.get("environmentalStandards", [])),
+        ]
+
+        if matches("quality", "productquality", "质量", "品质"):
+            return rating_score if rating is not None else (80.0 if certifications else 45.0)
+        if matches("reputation", "supplierreputation", "reliability", "信誉", "声誉", "可靠"):
+            return rating_score
+        if matches("certification", "certifications", "compliance", "认证", "资质"):
+            return 90.0 if certifications else 25.0
+        if matches("environment", "environmental", "sustainability", "esg", "environmentalstandards", "环保", "环境", "可持续"):
+            return 92.0 if any("14001" in item or "eco" in item or "esg" in item for item in environment) else 35.0
+        if matches("capacity", "productioncapacity", "manufacturingcapacity", "生产能力", "产能"):
+            return 82.0 if candidate.get("productionCapacity") or candidate.get("employees") else 40.0
+        if matches("minimumorderquantity", "moq", "minimumquantity", "最低订购量", "最小起订量", "起订量"):
+            return 80.0 if candidate.get("minimumOrderQuantity") else 40.0
+        if matches("region", "location", "geography", "country", "地区", "区域", "地点"):
+            return 82.0 if candidate.get("country") else 35.0
+        if matches("incumbent", "supplierhistory", "historicalperformance", "pastperformance", "preferredsupplier", "历史", "合作记录", "历史表现"):
+            return 92.0 if candidate.get("preferred") or candidate.get("source") == "database" else 45.0
+        if matches("price", "cost", "价格", "报价", "成本"):
+            return 72.0 if candidate.get("unitPriceEur") is not None else 45.0
+        if matches("delivery", "leadtime", "deliverytime", "交付", "交期", "交货"):
+            return 72.0 if candidate.get("deliveryDays") is not None else 45.0
+        if matches("payment", "paymentterms", "付款", "支付"):
+            return 72.0 if candidate.get("paymentTerm") or candidate.get("paymentLabel") else 45.0
+        # A custom criterion with no stored evidence remains visibly neutral;
+        # it must not be treated as a positive verification signal.
+        return 50.0
+
+    @staticmethod
     def _quote_normalization_stats(candidates: list[dict]) -> dict[str, float]:
         prices = [float(item.get("unitPriceEur")) for item in candidates if item.get("unitPriceEur") is not None]
         deliveries = [float(item.get("deliveryDays")) for item in candidates if item.get("deliveryDays") is not None]
@@ -232,7 +394,7 @@ class LLMRanker:
         """
         score = int(candidate.get("matchScore", 0))
         if candidate.get("source") == "database" or candidate.get("repurchasePriority") == "database":
-            score += 3
+            score += 3  # 只做轻微复购偏好，不能压过明显更相关的网络供应商
         return max(0, min(100, score))
 
     @staticmethod

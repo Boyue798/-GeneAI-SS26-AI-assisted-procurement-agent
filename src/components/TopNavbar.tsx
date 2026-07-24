@@ -30,8 +30,8 @@ export function TopNavbar({
     .toUpperCase()
 
   return (
-    <header className="flex w-full shrink-0 items-center bg-white shadow-sm print:hidden">
-      <div className="flex w-[260px] shrink-0 items-center px-5 py-4">
+    <header className="procurement-topbar flex w-full shrink-0 items-center print:hidden">
+      <div className="procurement-topbar__brand flex shrink-0 items-center px-5 py-4">
         <img
           src={FUYAO_LOGO_SRC}
           alt="Fuyao Europe Logo"
@@ -40,10 +40,10 @@ export function TopNavbar({
           height={40}
         />
       </div>
-      <div className="flex min-w-0 flex-1 items-center justify-between gap-6 py-4 pl-6 pr-10">
+      <div className="procurement-topbar__content flex min-w-0 flex-1 items-center justify-between gap-6 py-4 pl-6">
         <div className="min-w-0">
-          <h1 className="text-xl font-bold text-slate-900">{moduleTitle}</h1>
-          <p className="mt-0.5 text-sm text-gray-500">{subtitle}</p>
+          <h1 className="procurement-topbar__title">{moduleTitle}</h1>
+          <p className="procurement-topbar__subtitle mt-0.5 text-sm">{subtitle}</p>
         </div>
         <div className="flex shrink-0 items-center gap-4">
           <LanguageToggle language={language} onChange={onLanguageChange} />
@@ -51,9 +51,9 @@ export function TopNavbar({
             <button
               type="button"
               onClick={() => setMenuOpen((o) => !o)}
-              className="flex items-center gap-2 rounded-full border border-slate-200 py-1 pl-1 pr-3 transition-colors hover:bg-slate-50"
+              className="procurement-user-menu flex items-center gap-2 border py-1 pl-1 pr-3"
             >
-              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-blue-600 text-xs font-semibold text-white">
+              <span className="procurement-user-menu__initials flex h-8 w-8 items-center justify-center text-xs font-semibold text-white">
                 {initials}
               </span>
               <span className="hidden text-sm font-medium text-slate-700 sm:block">{user?.name}</span>
@@ -66,7 +66,7 @@ export function TopNavbar({
                   onClick={() => setMenuOpen(false)}
                   aria-hidden
                 />
-                <div className="absolute right-0 z-20 mt-2 w-56 rounded-lg border border-slate-200 bg-white py-1 shadow-lg">
+                <div className="procurement-user-popover absolute right-0 z-20 mt-2 w-56 border bg-white py-1">
                   <div className="border-b border-slate-100 px-4 py-3">
                     <p className="text-sm font-semibold text-slate-900">{user?.name}</p>
                     <p className="truncate text-xs text-slate-500">{user?.email}</p>

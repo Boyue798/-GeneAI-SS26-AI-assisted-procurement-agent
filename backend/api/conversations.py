@@ -1,30 +1,69 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
+import re
 import time
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-import psycopg2
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from psycopg2.extras import Json, RealDictCursor
 from pydantic import BaseModel, Field
+
+try:
+    import psycopg2
+    from psycopg2.extras import Json, RealDictCursor
+except ModuleNotFoundError:  # Local JSON conversation fallback remains available.
+    psycopg2 = None  # type: ignore[assignment]
+    Json = None  # type: ignore[assignment]
+    RealDictCursor = None  # type: ignore[assignment]
 
 from api.auth import AuthUser, get_current_user
 from db_writer import promote_candidate_to_supplier  # 新加的 import
 
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
+logger = logging.getLogger(__name__)
 
 
 # ── Local fallback for development only ───────────────────────────────────
 # Production should set DATABASE_URL; then records are stored in Postgres/Supabase.
 _CONVERSATIONS_DIR = Path(__file__).resolve().parents[1] / "data" / "conversations"
-_CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
 _CONVERSATIONS_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
 _DB_READY = False
+
+# PostgreSQL text/JSONB values cannot contain NUL, and crawled web/PDF
+# evidence occasionally includes other C0/C1 control characters.  Clean them
+# before handing any request-derived structure to psycopg2's Json adapter.
+_JSON_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _sanitize_json_value(value: Any) -> Any:
+    """Return a JSON-safe copy with unsafe control characters removed.
+
+    Snapshots contain arbitrary nested search evidence, so both values and
+    dictionary keys must be cleaned recursively. Non-finite floats are not
+    valid JSONB values and are converted to ``None`` as a defensive fallback.
+    """
+    if isinstance(value, str):
+        return _JSON_CONTROL_CHARS.sub("", value)
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, BaseModel):
+        return _sanitize_json_value(value.model_dump())
+    if isinstance(value, dict):
+        return {
+            _JSON_CONTROL_CHARS.sub("", str(key)): _sanitize_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_json_value(item) for item in value]
+    return _JSON_CONTROL_CHARS.sub("", str(value))
 
 
 def _now_ms() -> int:
@@ -50,6 +89,7 @@ def _load_user_conversations(email: str) -> dict[str, dict[str, Any]]:
 
 def _save_user_conversations(email: str, data: dict[str, dict[str, Any]]) -> None:
     fp = _user_file(email)
+    fp.parent.mkdir(parents=True, exist_ok=True)
     tmp = fp.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, default=str, indent=2)
@@ -68,10 +108,21 @@ def _database_url() -> str | None:
 
 
 def _db_conn():
+    if psycopg2 is None:
+        return None
     database_url = _database_url()
     if not database_url:
         return None
-    return psycopg2.connect(database_url)
+    try:
+        raw_timeout = os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "3")
+        timeout = max(1, min(15, int(float(raw_timeout))))
+    except (TypeError, ValueError):
+        timeout = 3
+    try:
+        return psycopg2.connect(database_url, connect_timeout=timeout)
+    except Exception as exc:
+        logger.warning("Conversation database unavailable; using local history fallback: %s", exc)
+        return None
 
 
 def _ensure_table(conn) -> None:
@@ -173,9 +224,18 @@ class ConversationRestore(BaseModel):
     quantity: str | None = None
     unit: str | None = None
     brand: str | None = None
+    model: str | None = None
+    specifications: str | None = None
+    standards: str | None = None
     structuredCategory: str | None = None
     structuredCountry: str | None = None
     structuredCerts: str | None = None
+    # Preserve arbitrary custom scoring dimensions when a past procurement
+    # request is reopened.  Keys deliberately remain open-ended.
+    criteria: list[dict[str, Any]] | None = None
+    # Module-specific names are kept for backwards-compatible frontend restore.
+    sourcingCriteria: list[dict[str, Any]] | None = None
+    comparisonCriteria: list[dict[str, Any]] | None = None
 
 
 class FeedbackRecord(BaseModel):
@@ -267,7 +327,11 @@ async def create_conversation(
     req: NewConversation,
     current_user: Annotated[AuthUser, Depends(get_current_user)],
 ) -> ConversationRecord:
-    record = ConversationRecord(**req.model_dump(), id=uuid4().hex, timestamp=_now_ms())
+    # Do this before constructing the record so the local fallback and all
+    # PostgreSQL fields (including the plain-text query) share the same safe
+    # representation.
+    clean_request = _sanitize_json_value(req.model_dump())
+    record = ConversationRecord(**clean_request, id=uuid4().hex, timestamp=_now_ms())
     conn = _db_conn()
     if conn is None:
         _local_put(current_user.email, record)
@@ -335,13 +399,14 @@ async def attach_feedback(
     except Exception as e:
         print(f"[conversations] 转正供应商失败，不影响反馈保存: {e}")
 
+    clean_feedback = _sanitize_json_value(req.model_dump())
     conn = _db_conn()
     if conn is None:
         records = _get_local_records(current_user.email)
         raw = records.get(id)
         if raw is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "NOT_FOUND", "message": "Conversation not found"})
-        raw["feedback"] = req.model_dump()
+        raw["feedback"] = clean_feedback
         _save_user_conversations(current_user.email, records)
         return ConversationRecord(**raw)
     try:
@@ -354,7 +419,7 @@ async def attach_feedback(
                 WHERE id = %s AND user_email = %s
                 RETURNING *
                 """,
-                (Json(req.model_dump()), id, current_user.email),
+                (Json(clean_feedback), id, current_user.email),
             )
             row = cur.fetchone()
         conn.commit()

@@ -63,13 +63,13 @@ def get_current_user(
         )
     token = credentials.credentials
     email = MOCK_TOKENS.get(token)
-    record = MOCK_USERS.get(email or "")
-    if record is None:
+    if not email:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "UNAUTHORIZED", "message": "Invalid or expired token"},
             headers={"WWW-Authenticate": "Bearer"},
         )
+    record = MOCK_USERS.get(email)
     return record["user"]  # type: ignore[return-value]
 
 

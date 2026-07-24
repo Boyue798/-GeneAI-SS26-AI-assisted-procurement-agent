@@ -68,11 +68,11 @@ export function AgentChatProgress({ job, copy }: AgentChatProgressProps) {
   }, [events.length, job?.status])
 
   return (
-    <section className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm ring-1 ring-slate-100 print:hidden">
-      <div className="border-b border-slate-100 bg-gradient-to-br from-slate-950 via-blue-950 to-slate-900 px-6 py-5 text-white">
+    <section className="agent-progress overflow-hidden border bg-white print:hidden">
+      <div className="agent-progress__header border-b px-6 py-5 text-white">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="flex items-start gap-3">
-            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-white/12 text-sm font-bold text-white ring-1 ring-white/20 backdrop-blur">
+            <div className="agent-progress__status-icon flex h-11 w-11 shrink-0 items-center justify-center bg-white/12 text-sm font-bold text-white ring-1 ring-white/20 backdrop-blur">
               {isRunning ? (
                 <span className="relative flex h-5 w-5 items-center justify-center" aria-label="Agent is working">
                   <span className="absolute h-5 w-5 animate-ping rounded-full bg-sky-300/60" />
@@ -83,10 +83,10 @@ export function AgentChatProgress({ job, copy }: AgentChatProgressProps) {
               )}
             </div>
             <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-sky-200">{copy.eyebrow}</p>
+              <p className="agent-progress__eyebrow text-xs font-semibold uppercase tracking-[0.18em]">{copy.eyebrow}</p>
               <h2 className="mt-1 text-lg font-semibold text-white">{statusLabel}</h2>
               {isRunning && (
-                <div className="mt-2 inline-flex items-center gap-2 rounded-full bg-sky-400/15 px-2.5 py-1 text-xs font-semibold text-sky-100 ring-1 ring-sky-300/30">
+                <div className="agent-progress__active-label mt-2 inline-flex items-center gap-2 bg-sky-400/15 px-2.5 py-1 text-xs font-semibold text-sky-100 ring-1 ring-sky-300/30">
                   <span className="relative flex h-2.5 w-2.5">
                     <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-300 opacity-70" />
                     <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-sky-200" />
@@ -94,34 +94,32 @@ export function AgentChatProgress({ job, copy }: AgentChatProgressProps) {
                   {copy.activeLabel}
                 </div>
               )}
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">
-                小型 Agent 聊天窗口：展示真实搜索、打开页面、抽取证据、过滤和排序过程；不展示模型隐藏草稿。
-              </p>
+              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">{copy.description}</p>
             </div>
           </div>
-          <div className="rounded-2xl bg-white/10 px-4 py-3 text-right ring-1 ring-white/15 backdrop-blur">
+          <div className="agent-progress__metric bg-white/10 px-4 py-3 text-right ring-1 ring-white/15 backdrop-blur">
             <p className="text-xs font-semibold uppercase tracking-wider text-slate-300">{copy.progress}</p>
             <p className="text-2xl font-semibold text-white">{progress}%</p>
           </div>
         </div>
 
         <div className="mt-5 h-2 overflow-hidden rounded-full bg-white/10 ring-1 ring-white/10">
-          <div className="relative h-full overflow-hidden rounded-full bg-sky-300 transition-[width] duration-700 ease-out" style={{ width: `${progress}%` }}>
+          <div className="agent-progress__fill relative h-full overflow-hidden rounded-full transition-[width] duration-700 ease-out" style={{ width: `${progress}%` }}>
             {isRunning && <span className="absolute inset-0 animate-pulse bg-white/40" />}
           </div>
         </div>
 
         <div className="mt-4 flex flex-wrap gap-2 text-xs text-slate-300">
-          <span className="rounded-full bg-white/10 px-2.5 py-1 ring-1 ring-white/10">消息 {events.length}</span>
-          <span className="rounded-full bg-white/10 px-2.5 py-1 ring-1 ring-white/10">搜索 {runSummary.searches}</span>
-          <span className="rounded-full bg-white/10 px-2.5 py-1 ring-1 ring-white/10">开页 {runSummary.openedPages}</span>
-          <span className="rounded-full bg-white/10 px-2.5 py-1 ring-1 ring-white/10">抽价 {runSummary.extractedPrices}</span>
+          <span className="rounded-full bg-white/10 px-2.5 py-1 ring-1 ring-white/10">{copy.messagesLabel} {events.length}</span>
+          <span className="rounded-full bg-white/10 px-2.5 py-1 ring-1 ring-white/10">{copy.searchesLabel} {runSummary.searches}</span>
+          <span className="rounded-full bg-white/10 px-2.5 py-1 ring-1 ring-white/10">{copy.pagesLabel} {runSummary.openedPages}</span>
+          <span className="rounded-full bg-white/10 px-2.5 py-1 ring-1 ring-white/10">{copy.pricesLabel} {runSummary.extractedPrices}</span>
         </div>
       </div>
 
-      <div className="bg-slate-50/80 p-5">
+      <div className="agent-progress__body p-5">
         <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">{copy.thoughtLogLabel}</p>
-        <div ref={eventListRef} className="mt-3 max-h-[420px] space-y-3 overflow-auto rounded-2xl border border-slate-200 bg-white p-3 pr-2 shadow-inner">
+        <div ref={eventListRef} className="agent-progress__log mt-3 max-h-[420px] space-y-3 overflow-auto border bg-white p-3 pr-2">
           {events.length === 0 ? (
             <p className="px-2 py-8 text-center text-sm leading-6 text-slate-500 italic">{copy.emptyText}</p>
           ) : (

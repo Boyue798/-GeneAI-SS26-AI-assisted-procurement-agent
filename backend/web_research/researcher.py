@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from pydantic import BaseModel, Field
 def _quick_extract_eur_price(text: str) -> float | None:
     import re
     patterns = [
+        r'(?:EUR|Euro)\s*([0-9][0-9.,]*(?:[.,][0-9]{2})?)',
         r'€\s*([0-9][0-9.,]*(?:[.,][0-9]{2})?)',
         r'€\s*([0-9][0-9.,]*)\s*(?:[-\u2013]|,\u2013)',
         r'([0-9][0-9.,]*(?:[.,][0-9]{2})?)\s*(?:EUR|Euro|€)',
@@ -51,6 +53,8 @@ def _parse_price_number(raw: str) -> float | None:
             value = "".join(parts[:-1]) + "." + parts[-1]
         elif len(parts) > 2:
             value = "".join(parts)
+        elif len(parts) == 2 and len(parts[-1]) == 3:
+            value = "".join(parts)
     try:
         return float(value)
     except ValueError:
@@ -84,7 +88,7 @@ class DeepEvidence:
 
 
 class SearchProvider(Protocol):
-    async def search(self, query: str, max_results: int = 8) -> list[SearchResult]: ...
+    async def search(self, query: str, max_results: int = 15) -> list[SearchResult]: ...
 
 
 class PageFetcher(Protocol):
@@ -92,39 +96,175 @@ class PageFetcher(Protocol):
     async def fetch_page(self, url: str) -> PageSnapshot: ...
 
 
-class DuckDuckGoSearchProvider:
-    async def search(self, query: str, max_results: int = 8) -> list[SearchResult]:
+class SearXNGSearchProvider:
+    """Bounded public-web search for supplier discovery.
+
+    The default path uses the ``ddgs`` package and deliberately does *not*
+    reuse ``OPENAI_API_KEY`` or send it to a different provider.  A private
+    SearXNG deployment can be preferred by setting ``SEARXNG_BASE_URL``;
+    DDGS remains the fallback when that endpoint is unavailable.  Both paths
+    have a hard request timeout and a small result cap so a failed search does
+    not stall the procurement workflow.
+    """
+
+    MAX_RESULTS = 12
+    DEFAULT_TIMEOUT_SECONDS = 7.0
+
+    def __init__(
+        self,
+        searxng_base_url: str | None = None,
+        timeout_seconds: float | None = None,
+        region: str | None = None,
+    ):
+        configured_url = (
+            searxng_base_url
+            if searxng_base_url is not None
+            else os.getenv("SEARXNG_BASE_URL", "")
+        ).strip()
+        self.searxng_base_url = (
+            configured_url.rstrip("/")
+            if configured_url.startswith(("http://", "https://"))
+            else ""
+        )
+        self.timeout_seconds = self._bounded_timeout(timeout_seconds)
+        self.region = (region or os.getenv("DDGS_REGION", "de-de")).strip() or "de-de"
+
+    async def search(self, query: str, max_results: int = 15) -> list[SearchResult]:
+        """Search SearXNG when explicitly configured, otherwise use DDGS.
+
+        ``asyncio.to_thread`` keeps the blocking client off the event loop,
+        while the client-level and coroutine-level timeouts bound failures.
+        """
+        normalized_query = " ".join(str(query or "").split())
+        if not normalized_query:
+            return []
+
+        limit = self._bounded_limit(max_results)
+        if self.searxng_base_url:
+            searxng_results = await self._run_bounded(
+                self._searxng_search_sync, normalized_query, limit
+            )
+            if searxng_results:
+                return searxng_results
+
+        return await self._run_bounded(self._ddgs_search_sync, normalized_query, limit)
+
+    @classmethod
+    def _bounded_limit(cls, max_results: int) -> int:
+        try:
+            requested = int(max_results)
+        except (TypeError, ValueError):
+            requested = cls.MAX_RESULTS
+        return max(1, min(requested, cls.MAX_RESULTS))
+
+    @classmethod
+    def _bounded_timeout(cls, timeout_seconds: float | None) -> float:
+        if timeout_seconds is None:
+            raw_timeout = os.getenv("WEB_SEARCH_TIMEOUT_SECONDS", str(cls.DEFAULT_TIMEOUT_SECONDS))
+        else:
+            raw_timeout = timeout_seconds
+        try:
+            requested = float(raw_timeout)
+        except (TypeError, ValueError):
+            requested = cls.DEFAULT_TIMEOUT_SECONDS
+        return max(2.0, min(requested, 15.0))
+
+    async def _run_bounded(self, search_fn, query: str, limit: int) -> list[SearchResult]:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(search_fn, query, limit),
+                timeout=self.timeout_seconds + 0.5,
+            )
+        except (asyncio.TimeoutError, Exception):
+            return []
+
+    def _ddgs_search_sync(self, query: str, limit: int) -> list[SearchResult]:
+        """Run DDGS synchronously; callers keep it bounded off the event loop."""
         try:
             try:
                 from ddgs import DDGS
             except ImportError:
+                # Older installations used this package name. Keep the
+                # compatibility fallback without making it a runtime dependency.
                 from duckduckgo_search import DDGS
 
-            def run() -> list[SearchResult]:
-                with DDGS(timeout=8) as ddgs:
-                    rows = list(ddgs.text(query, max_results=max_results))
-                # Filter: prefer German (.de) and EU results, reject Asian TLDs
-                filtered = []
-                for row in rows:
-                    url = row.get("href") or row.get("url") or ""
-                    from urllib.parse import urlparse as _up
-                    tld = (_up(url).netloc or "").split(".")[-1].lower() if url else ""
-                    if tld in ("cn", "tw", "jp", "kr", "hk", "ru", "br", "in"):
-                        continue  # Skip non-European results
-                    filtered.append(row)
-                return [
-                    SearchResult(
-                        title=row.get("title") or "Web supplier",
-                        url=row.get("href") or row.get("url") or "",
-                        snippet=row.get("body") or "",
-                    )
-                    for row in filtered
-                    if row.get("href") or row.get("url")
-                ]
+            try:
+                client = DDGS(timeout=self.timeout_seconds)
+            except TypeError:
+                client = DDGS()
 
-            return await asyncio.to_thread(run)
+            try:
+                raw_results = client.text(
+                    query,
+                    region=self.region,
+                    safesearch="moderate",
+                    max_results=limit,
+                )
+            except TypeError:
+                # Compatibility with older DDGS releases that do not expose
+                # all current keyword arguments.
+                raw_results = client.text(query, max_results=limit)
+            return self._normalize_results(raw_results, limit)
         except Exception:
             return []
+
+    def _searxng_search_sync(self, query: str, limit: int) -> list[SearchResult]:
+        """Query an explicitly configured private SearXNG JSON endpoint."""
+        if not self.searxng_base_url:
+            return []
+        try:
+            import httpx
+
+            endpoint = self.searxng_base_url
+            if not endpoint.endswith("/search"):
+                endpoint = f"{endpoint}/search"
+            response = httpx.get(
+                endpoint,
+                params={
+                    "q": query,
+                    "format": "json",
+                    "language": "auto",
+                    "safesearch": 1,
+                },
+                headers={"User-Agent": "ProcureAI/1.0"},
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            return self._normalize_results(payload.get("results", []), limit)
+        except Exception:
+            return []
+
+    @staticmethod
+    def _normalize_results(raw_results: Any, limit: int) -> list[SearchResult]:
+        if not isinstance(raw_results, (list, tuple)):
+            return []
+
+        normalized: list[SearchResult] = []
+        seen_urls: set[str] = set()
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("href") or item.get("url") or item.get("link") or "").strip()
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                continue
+            canonical_url = url.split("#", 1)[0]
+            if canonical_url in seen_urls:
+                continue
+            seen_urls.add(canonical_url)
+            title = str(item.get("title") or parsed.netloc or "Web result").strip()
+            snippet = str(
+                item.get("body")
+                or item.get("snippet")
+                or item.get("description")
+                or item.get("content")
+                or ""
+            ).strip()
+            normalized.append(SearchResult(title=title, url=canonical_url, snippet=snippet))
+            if len(normalized) >= limit:
+                break
+        return normalized
 
 
 class StaticPageFetcher:
@@ -431,11 +571,47 @@ class WebResearcher:
         "what is", "why you", "should you",
     )
 
+    # These pages can mention a company, product, or certification but are not
+    # the supplier's profile. They must not become candidates merely because a
+    # search query supplied matching terms.
+    NON_SUPPLIER_HOST_MARKERS = (
+        "company-registry", "business-registry", "manufacturer-directory",
+        "supplier-directory", "company-directory", "certipedia", "iatfglobaloversight",
+    )
+    NON_SUPPLIER_PATH_MARKERS = (
+        "/news/", "/press/", "/blog/", "/article/", "/articles/",
+        "/registry/", "/register/", "/directory/", "/listing/",
+        "/industrie-hersteller/", "/manufacturers/", "/forum/", "/forums/", "/thread/",
+    )
+
+    # Supplier pages must show an observable signal for the requested product
+    # family. This prevents a certificate record from becoming a supplier just
+    # because the buyer's query itself mentioned IATF or a product brand.
+    CATEGORY_PRODUCT_TERMS: dict[str, tuple[str, ...]] = {
+        "glassAdhesive": ("adhesive", "klebstoff", "kleber", "scheibenkleber", "urethane", "polyurethane", "teroson", "sikatack", "windshield", "windscreen", "windschutzscheibe", "autoglas", "direct glazing"),
+        "rubberSeal": ("rubber seal", "sealing", "dichtung", "weatherstrip", "epdm"),
+        "waterDeflector": ("water deflector", "wasserabweiser", "beltline"),
+        "glassRaw": ("float glass", "floatglas", "automotive glass", "glas"),
+        "hardware": ("fastener", "befestigung", "schraube", "mutter", "rivet", "bolt"),
+        "laptop": ("laptop", "notebook", "thinkpad", "elitebook", "computer"),
+        "monitor": ("monitor", "display", "bildschirm", "screen"),
+        "phone": ("phone", "smartphone", "iphone", "handy"),
+        "accessory": ("dock", "docking", "headset", "keyboard", "tastatur", "mouse", "maus"),
+        "workstation": ("workstation", "zbook", "desktop", "arbeitsstation"),
+        "paper": ("paper", "papier", "kopierpapier", "druckerpapier", "a4"),
+        "packaging": ("packaging", "verpackung", "box", "carton", "corrugated"),
+        "cleaning": ("cleaning", "reinigung", "spülmittel", "hygiene"),
+        "office": ("office", "büro", "buero", "bürobedarf", "paper", "papier", "ordner", "folder"),
+        "safetyShoes": ("safety shoe", "sicherheitsschuh", "schutzschuh", "s3"),
+        "firstAid": ("first aid", "erste hilfe", "verband", "pflaster"),
+        "equipment": ("pneumatic", "pneumatik", "anschluss", "fitting", "ventil", "schlauch"),
+    }
+
     # High-signal B2B directories — search results from these domains
     # are automatically ranked higher.
     B2B_DIRECTORY_DOMAINS = (
         "wlw.de", "wer-liefert-was.de",
-        "europages.de", "europages.com",
+        "europages.de", "europages.com", "europages.co.uk",
         "kompass.com",
         "industrystock.de", "industrystock.com",
         "directindustry.com", "directindustry.de",
@@ -447,7 +623,8 @@ class WebResearcher:
     # suppliers, not individual supplier profiles, so they should be excluded.
     DIRECTORY_SEARCH_PATH_PATTERNS = (
         "/de/suche/", "/en/search/", "/fr/recherche/",
-        "/unternehmen/", "/companies/",
+        "/unternehmen/", "/companies/", "/showroom/", "/suppliers/",
+        "/lieferanten/", "/tag/",
     )
 
     OFFICE_FALLBACK_SUPPLIERS: list[dict] = [
@@ -495,7 +672,7 @@ class WebResearcher:
         page_fetcher: PageFetcher | None = None,
         llm: Any = None,
     ):
-        self.search_provider = search_provider or DuckDuckGoSearchProvider()
+        self.search_provider = search_provider or SearXNGSearchProvider()
         self.page_fetcher = page_fetcher or StaticPageFetcher()
         self.llm = llm
 
@@ -504,105 +681,198 @@ class WebResearcher:
     # ------------------------------------------------------------------
 
     async def research(self, intent: ProcurementIntent, max_suppliers: int = 8,
-                       progress=None) -> list[dict]:
+                       progress=None, timeout: float = 120.0) -> list[dict]:
         """LLM-driven supplier discovery pipeline.
 
         When *progress* is provided, it is called as progress(phase, message, pct)
         whenever a meaningful step completes, so the frontend can display the
         agent's real-time thought process.
+
+        All parallelisable steps race LLM vs rule-based paths; total timeout
+        enforced via asyncio.wait_for to prevent runaway pipelines.
         """
-        if progress:
-            progress("think", "正在通过 LLM 规划 B2B 供应商搜索策略...", 46)
+        # Captured for timeout fallback — return whatever we have
+        collected_suppliers: list[dict] = []
 
-        # 1. LLM plans search queries
-        queries = await self._llm_plan_queries(intent)
-        if not queries:
-            queries = self._rule_plan_queries(intent)
+        async def _do_research() -> list[dict]:
+            nonlocal collected_suppliers
 
-        if progress:
-            progress("think", f"LLM 生成了 {len(queries)} 条针对性的 B2B 搜索查询，准备依次执行...", 48)
-
-        # 2. Execute queries, collect results
-        collected: dict[str, SearchResult] = {}
-        executed_queries: set[str] = set()
-
-        async def execute_query_batch(batch: list[str], start_index: int = 0, label: str = "搜索") -> None:
-            nonlocal collected
-            total = min(len(batch), 6)
-            for idx, query in enumerate(batch[:6]):
-                if query in executed_queries:
-                    continue
-                executed_queries.add(query)
-                results = await self._search_with_retry(query, max_results=10)
-                new_count = 0
-                for result in results:
-                    if not self._url_ok(result.url):
-                        continue
-                    key = self._url_key(result.url) or result.title.lower()
-                    if key and key not in collected:
-                        collected[key] = result
-                        new_count += 1
-                if progress:
-                    progress("think",
-                             f"{label} [{idx+1}/{total}]: {query[:50]}... → 新增 {new_count} 条，累计 {len(collected)} 条",
-                             48 + int((start_index + idx) * 3))
-                if len(collected) >= max_suppliers * 3:
-                    break
-
-        await execute_query_batch(queries, label="搜索")
-
-        if len(collected) < max_suppliers * 2:
-            fallback_queries = [q for q in self._rule_plan_queries(intent) if q not in executed_queries]
-            if progress and fallback_queries:
-                progress("think", f"LLM 查询结果偏少（{len(collected)} 条），追加规则 B2B 查询兜底...", 58)
-            await execute_query_batch(fallback_queries, start_index=len(queries), label="兜底搜索")
-
-        results_list = list(collected.values())
-        if progress:
-            progress("think", f"共收集到 {len(results_list)} 条候选搜索结果，正在用 LLM 判断哪些是真正的供应商页面...", 60)
-
-        # 3. LLM judges which results are real supplier pages
-        relevant = await self._llm_filter_relevant(results_list, intent)
-        min_relevant = min(len(results_list), max_suppliers * 2)
-        if len(relevant) < min_relevant:
-            rule_relevant = self._rule_filter_relevant(results_list, intent)
-            relevant = self._merge_search_results(relevant, rule_relevant)[:min_relevant]
             if progress:
-                progress("think", f"LLM 筛选结果偏少，已用规则信号补足到 {len(relevant)} 条候选，避免同一问题结果数量大幅波动。", 64)
+                progress("think", "正在通过 LLM 规划 B2B 供应商搜索策略...", 46)
 
-        if progress:
-            progress("think", f"LLM 筛选完成：从 {len(results_list)} 条中识别出 {len(relevant)} 条相关供应商", 65)
+            # ── 1. LLM + rule query planning in parallel ──
+            #     Take whichever returns first; cancel the slower one.
+            llm_q = asyncio.create_task(self._llm_plan_queries(intent))
+            rule_q = asyncio.create_task(asyncio.to_thread(self._rule_plan_queries, intent))
+            done, pending = await asyncio.wait(
+                [llm_q, rule_q], return_when=asyncio.FIRST_COMPLETED, timeout=8.0,
+            )
+            queries: list[str] = []
+            if llm_q in done and not llm_q.exception():
+                queries = llm_q.result()
+            if not queries and rule_q in done and not rule_q.exception():
+                queries = rule_q.result()
+            for t in pending:
+                t.cancel()
+            for t in pending:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            # If neither produced useful results, fall back synchronously.
+            # _rule_plan_queries is a pure function — re-invocation is safe.
+            if not queries:
+                queries = self._rule_plan_queries(intent)
 
-        # 4. Extract supplier profiles from relevant results
-        suppliers: list[dict] = []
-        for idx, result in enumerate(relevant[:max_suppliers * 2]):
-            if progress and result.title:
-                progress("think", f"正在提取供应商信息 [{idx+1}/{min(len(relevant), max_suppliers*2)}]: {result.title[:50]}", 
-                         65 + int(idx * 2))
-            supplier = await self._result_to_supplier(result, intent, progress=progress, index=idx+1,
-                                                     total=min(len(relevant), max_suppliers*2))
-            if supplier:
-                suppliers.append(supplier)
-            if len(suppliers) >= max_suppliers:
-                break
+            if progress:
+                progress("think", f"生成了 {len(queries)} 条针对性的 B2B 搜索查询，准备并行执行...", 48)
 
-        # 5. Merge with category fallback suppliers
-        suppliers = self.merge_supplier_lists(suppliers, self._fallback_suppliers(intent))
-        return suppliers[:max_suppliers]
+            # ── 2. Execute queries, collect results ──
+            collected: dict[str, SearchResult] = {}
+            executed_queries: set[str] = set()
+
+            async def execute_query_batch(batch: list[str], start_index: int = 0, label: str = "搜索") -> None:
+                nonlocal collected
+                to_run = [q for q in batch[:6] if q not in executed_queries]
+                if not to_run:
+                    return
+                for q in to_run:
+                    executed_queries.add(q)
+                # 并行执行所有搜索
+                tasks = [self._search_with_retry(q, max_results=10) for q in to_run]
+                all_results = await asyncio.gather(*tasks, return_exceptions=True)
+                for idx, (query, results) in enumerate(zip(to_run, all_results)):
+                    if isinstance(results, Exception):
+                        continue
+                    new_count = 0
+                    for result in results:
+                        if not self._is_candidate_result_eligible(result, intent):
+                            continue
+                        key = self._url_key(result.url) or result.title.lower()
+                        if key and key not in collected:
+                            collected[key] = result
+                            new_count += 1
+                    if progress:
+                        progress("think",
+                                 f"{label} [{idx+1}/{len(to_run)}]: {query[:50]}... → 新增 {new_count} 条，累计 {len(collected)} 条",
+                                 48 + int((start_index + idx) * 3))
+                    if len(collected) >= max_suppliers * 3:
+                        break
+
+            await execute_query_batch(queries, label="搜索")
+
+            if len(collected) < max_suppliers * 2:
+                fallback_queries = [q for q in self._rule_plan_queries(intent) if q not in executed_queries]
+                if progress and fallback_queries:
+                    progress("think", f"LLM 查询结果偏少（{len(collected)} 条），追加规则 B2B 查询兜底...", 58)
+                await execute_query_batch(fallback_queries, start_index=len(queries), label="兜底搜索")
+
+            results_list = list(collected.values())
+            if progress:
+                progress("think", f"共收集到 {len(results_list)} 条候选搜索结果，正在判断哪些是真正的供应商页面...", 60)
+
+            # ── 3. Filter relevant results ──
+            #     Rule-based filter is instant and safe; LLM runs in background
+            #     for better quality but never blocks the pipeline.
+            rule_relevant = self._rule_filter_relevant(results_list, intent)
+
+            # Try LLM in background — fire-and-forget, don't cancel
+            llm_f = asyncio.create_task(self._llm_filter_relevant(results_list, intent))
+
+            # Use rule results immediately
+            relevant = rule_relevant
+
+            # If LLM finishes quickly, use its results instead
+            try:
+                llm_result = await asyncio.wait_for(llm_f, timeout=8.0)
+                if llm_result:
+                    relevant = [
+                        result
+                        for result in self._merge_search_results(relevant, llm_result)
+                        if self._is_candidate_result_eligible(result, intent)
+                    ]
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+
+            # Cap how many suppliers we process — prevents downstream bloat
+            max_process = min(max_suppliers * 2, 30)
+            min_relevant = min(len(results_list), max_process)
+            if len(relevant) < min_relevant:
+                rule_relevant = self._rule_filter_relevant(results_list, intent)
+                # A sparse search response can contain valid supplier pages
+                # whose title/snippet does not include the parsed product terms.
+                # Do not turn that situation into an empty table: retain the
+                # already URL-safe candidates as low-confidence leads and let
+                # extraction/verification mark missing evidence for review.
+                fallback_candidates = rule_relevant or [
+                    result for result in results_list if self._is_candidate_result_eligible(result, intent)
+                ]
+                relevant = self._merge_search_results(relevant, fallback_candidates)[:min_relevant]
+                if progress:
+                    fallback_label = "规则信号/安全候选"
+                    progress("think", f"筛选结果偏少，已用{fallback_label}补足到 {len(relevant)} 条候选；证据不足的结果会标记为需核验。", 64)
+            else:
+                relevant = relevant[:max_process]
+
+            if progress:
+                progress("think", f"筛选完成：从 {len(results_list)} 条中识别出 {len(relevant)} 条相关供应商", 65)
+
+            # ── 4. Extract supplier profiles in parallel ──
+            #     Semaphore bumped 3→5 for higher throughput (DDG fetches are
+            #     the bottleneck, not LLM concurrency).
+            _semaphore = asyncio.Semaphore(5)
+
+            async def _extract_with_limit(result, idx):
+                async with _semaphore:
+                    if progress and result.title:
+                        progress("think",
+                                 f"正在提取供应商信息 [{idx+1}/{min(len(relevant), max_process)}]: {result.title[:50]}",
+                                 65 + int(idx * 2))
+                    return await self._result_to_supplier(
+                        result, intent, progress=progress, index=idx + 1,
+                        total=min(len(relevant), max_process),
+                    )
+
+            tasks = [_extract_with_limit(result, idx) for idx, result in enumerate(relevant[:max_process])]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            suppliers = [s for s in results if isinstance(s, dict) and s]
+            suppliers = suppliers[:max_suppliers]
+
+            # ── 5. Merge with category fallback suppliers ──
+            suppliers = self.merge_supplier_lists(suppliers, self._fallback_suppliers(intent))
+            collected_suppliers = suppliers
+            return suppliers[:max_suppliers]
+
+        # Top-level timeout — returns partial results on timeout instead of crashing
+        try:
+            return await asyncio.wait_for(_do_research(), timeout=timeout)
+        except asyncio.TimeoutError:
+            if progress:
+                progress("think", f"研究超时（{timeout}s），返回已收集的供应商...", 90)
+            if collected_suppliers:
+                return collected_suppliers[:max_suppliers]
+            return []
 
     async def _search_with_retry(self, query: str, max_results: int = 10, attempts: int = 2) -> list[SearchResult]:
-        last: list[SearchResult] = []
-        for attempt in range(attempts):
+        """Search with one empty-result retry to reduce provider flapping.
+
+        DeepSeek web search usually needs ~10-12s, so keep the per-attempt
+        timeout at 20s. Retrying only empty/failed attempts improves stability
+        without adding a global cutoff that would discard network search.
+        """
+        for attempt in range(max(1, attempts)):
             try:
-                results = await self.search_provider.search(query, max_results=max_results)
-            except Exception:
-                results = []
-            if results:
-                return results
-            last = results
-            if attempt + 1 < attempts:
-                await asyncio.sleep(0.25)
-        return last
+                results = await asyncio.wait_for(
+                    self.search_provider.search(query, max_results=max_results),
+                    timeout=20.0,
+                )
+                if results:
+                    return results
+            except (asyncio.TimeoutError, Exception):
+                pass
+            if attempt < attempts - 1:
+                await asyncio.sleep(0.4)
+        return []
 
     # ------------------------------------------------------------------
     # LLM query planning
@@ -624,14 +894,13 @@ class WebResearcher:
             f"Keywords from user query: {keywords}\n"
             f"Budget: €{intent.max_price if intent.max_price else 'not specified'}\n"
             f"Delivery: {intent.max_delivery_days or 'not specified'} days\n\n"
-            "Generate 5-6 DuckDuckGo search queries to find REAL B2B suppliers on the web. "
+            "Generate 5-6 web search queries to find REAL B2B suppliers. "
             "Each query should be a complete search string, one per line.\n\n"
             "Rules:\n"
-            "- Target B2B directories: site:wlw.de, site:europages.de, site:kompass.com, site:lieferanten.de\n"
             "- Use the target country's language (German for Germany, French for France, etc.)\n"
-            "- Include B2B-specific terms: Lieferant, Großhandel, Hersteller, wholesaler, B2B\n"
-            "- Exclude consumer/retail noise: -Amazon -eBay -Pinterest\n"
-            "- Focus on the specific products/services the user needs\n\n"
+            "- Include B2B-specific terms: Lieferant, Großhandel, Hersteller, manufacturer, B2B, supplier\nStart with at least 2 queries targeting wlw.de, europages.de\n"
+            "- Focus on the specific products/services the user needs\n"
+            "- Use natural language queries — NO site: operators\n\n"
             "Return ONLY the queries, one per line. No numbering, no explanations."
         )
 
@@ -647,6 +916,7 @@ class WebResearcher:
             queries = []
             for line in content.strip().split("\n"):
                 q = line.strip().lstrip("0123456789.-) ").strip()
+                q = self._sanitize_search_query(q)
                 if q and len(q) > 10:
                     queries.append(q)
             return queries[:6]
@@ -719,7 +989,7 @@ class WebResearcher:
         """Rule-based fallback when LLM is unavailable."""
         relevant = []
         for r in results:
-            if not self._url_ok(r.url):
+            if not self._is_candidate_result_eligible(r, intent):
                 continue
             # Quick content page detection
             text = f"{r.title} {r.snippet}".lower()
@@ -737,6 +1007,75 @@ class WebResearcher:
                 relevant.append(r)
         return relevant[:16]
 
+    def _is_candidate_result_eligible(self, result: SearchResult, intent: ProcurementIntent) -> bool:
+        if not self._url_ok(result.url) or self.is_non_supplier_page(
+            title=result.title,
+            url=result.url,
+            text=result.snippet,
+        ):
+            return False
+        terms = self.CATEGORY_PRODUCT_TERMS.get(intent.category or "", ())
+        if not terms:
+            return True
+        result_text = f"{result.title} {result.snippet}".casefold()
+        if not any(term in result_text for term in terms):
+            return False
+
+        # A request for an automotive windscreen adhesive should not silently
+        # broaden into any industrial adhesive/tape manufacturer. Named
+        # products still allow equivalent suppliers when their page proves a
+        # direct-glazing, automotive-glass, or windscreen application.
+        if intent.category == "glassAdhesive":
+            requested_brands = {
+                str(value).casefold()
+                for value in intent.keywords
+                if str(value).casefold() in {"teroson", "sikatack"}
+            }
+            if requested_brands:
+                application_terms = (
+                    "windshield", "windscreen", "windschutzscheibe",
+                    "scheibenkleber", "autoglas", "direct glazing", "automotive",
+                )
+                return bool(
+                    any(brand in result_text for brand in requested_brands)
+                    or any(term in result_text for term in application_terms)
+                )
+        return True
+
+    @classmethod
+    def is_non_supplier_page(cls, *, title: object, url: object, text: object = "") -> bool:
+        """Reject directory, registry, and editorial pages before extraction."""
+
+        raw_url = str(url or "").strip()
+        parsed = urlparse(raw_url if "://" in raw_url else f"https://{raw_url}")
+        host = (parsed.hostname or "").casefold().removeprefix("www.")
+        path = (parsed.path or "").casefold()
+        title_text = str(title or "").casefold()
+        summary_text = str(text or "").casefold()
+        metadata = f"{title_text} {summary_text} {host} {path}"
+
+        if any(marker in host for marker in cls.NON_SUPPLIER_HOST_MARKERS):
+            return True
+        if "forum" in host:
+            return True
+        if any(marker in path for marker in cls.NON_SUPPLIER_PATH_MARKERS):
+            return True
+        if any(domain in host for domain in cls.B2B_DIRECTORY_DOMAINS):
+            if path in {"", "/"} or any(pattern in path for pattern in cls.DIRECTORY_SEARCH_PATH_PATTERNS):
+                return True
+        if re.search(r"\b(?:manufacturer|supplier|company|business|industry)\s+(?:directory|listing)\b", metadata):
+            return True
+        if re.search(r"\b(?:company|business|trade|commercial)\s+(?:registry|register)\b", metadata):
+            return True
+        if re.search(r"\b(?:iatf|iso\s*\d+)\s+(?:certificate|certification|registry|register)\b", metadata):
+            return True
+        if re.search(r"\b(?:news|press release|media release|article)\b", title_text):
+            return True
+        return bool(
+            re.match(r"^\s*\d{4,}\s*[-\u2013:]", str(title or ""))
+            and re.search(r"\b(?:iatf|iso\s*\d+|certificate|certification|registry|register)\b", metadata)
+        )
+
     @staticmethod
     def _merge_search_results(primary: list[SearchResult], secondary: list[SearchResult]) -> list[SearchResult]:
         merged: dict[str, SearchResult] = {}
@@ -753,6 +1092,8 @@ class WebResearcher:
     async def _result_to_supplier(self, result: SearchResult, intent: ProcurementIntent, progress=None,
                                   index: int = 1, total: int = 1) -> dict | None:
         """Extract a structured supplier profile from a search result."""
+        if not self._is_candidate_result_eligible(result, intent):
+            return None
         evidence = await self._build_deep_evidence(result, intent, progress=progress, index=index, total=total)
 
         if self.llm and evidence.text and not self._is_noisy_page(evidence.text):
@@ -772,7 +1113,8 @@ class WebResearcher:
             {
                 "name": self._clean_title(result.title),
                 "description": self._best_description(result.snippet, evidence.text),
-                "products": list(intent.keywords[:5]),
+                "products": self._observed_product_values(evidence.text, intent),
+                "certifications": self._observed_values(evidence.text, intent.certifications),
                 "capabilities": [intent.category] if intent.category else [],
             },
             result, intent, source="web-research",
@@ -918,25 +1260,38 @@ class WebResearcher:
     # Rule-based query planning (fallback)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _sanitize_search_query(query: str) -> str:
+        """Convert Google-only operators into DeepSeek-friendly natural language.
+
+        DeepSeek web_search does not understand site: or negative operators. Keep
+        the domain/product intent as plain words instead of sending unsupported syntax.
+        """
+        q = re.sub(r"\bsite:([^\s]+)", r"\1", query or "", flags=re.I)
+        q = re.sub(r"(?<!\w)-(?=[A-Za-z])", " ", q)
+        q = re.sub(r"[\"']", " ", q)
+        return re.sub(r"\s+", " ", q).strip()
+
     def _rule_plan_queries(self, intent: ProcurementIntent) -> list[str]:
         country = intent.country or "Germany"
         kw = " ".join(intent.keywords[:6])
         category = intent.category or ""
-        exclusions = "-amazon -ebay -pinterest -linkedin -youtube -tiktok"
         queries = []
 
-        # Always search B2B directories directly
+        # Priority: B2B directory-specific searches
+        queries.append(f"{kw} {category} wlw.de supplier {country}")
+        queries.append(f"{kw} {category} europages supplier {country}")
+
         if country == "Germany":
-            queries.append(f"site:wlw.de {kw} Lieferant {category}")
-            queries.append(f"site:europages.de {kw} Deutschland {category}")
-            queries.append(f"site:lieferanten.de {kw}")
-        queries.append(f"site:kompass.com {kw} {category} supplier {country}")
-        queries.append(f"site:industrystock.de {kw} {category}")
+            queries.append(f"{kw} {category} Lieferant Hersteller Deutschland")
+            queries.append(f"{kw} {category} B2B supplier Germany")
+        queries.append(f"{kw} {category} manufacturer supplier {country}")
+        queries.append(f"{kw} {category} Großhandel")
 
         # General web search with B2B terms
-        queries.append(f"{kw} {category} supplier {country} B2B wholesale {exclusions}")
+        queries.append(f"{kw} {category} supplier {country} B2B wholesale")
         if country == "Germany":
-            queries.append(f"{kw} Lieferant Großhandel Deutschland {category} {exclusions}")
+            queries.append(f"{kw} Lieferant Großhandel Deutschland {category}")
 
         return [q for q in queries if q][:6]
 
@@ -981,7 +1336,11 @@ class WebResearcher:
         return any(marker in normalized for marker in noise) or len(normalized) < 50 or len(normalized) > 12000
 
     def _fallback_suppliers(self, intent: ProcurementIntent) -> list[dict]:
-        if intent.category == "office":
+        # A single paper request is intentionally classified as ``paper`` for
+        # product comparison, while these suppliers are maintained as office
+        # suppliers. Reuse the existing office fallback for sourcing so a
+        # temporary unavailable web search does not produce an empty table.
+        if intent.category in {"office", "paper"}:
             return [
                 self._seed_to_supplier(s, intent)
                 for s in self.OFFICE_FALLBACK_SUPPLIERS
@@ -1004,8 +1363,11 @@ class WebResearcher:
             "country": data.get("country") or intent.country,
             "city": data.get("city"),
             "description": self._best_description(data.get("description", ""), result.snippet),
-            "products": self._ensure_list(data.get("products") or intent.keywords),
-            "certifications": self._ensure_list(data.get("certifications") or intent.certifications),
+            # A requested product or certification is not page evidence. Keep
+            # these empty when extraction did not observe them so downstream
+            # verification cannot claim a registry/news page is validated.
+            "products": self._ensure_list(data.get("products")),
+            "certifications": self._ensure_list(data.get("certifications")),
             "contactPerson": data.get("contactPerson"),
             "phone": data.get("phone"),
             "email": data.get("email"),
@@ -1080,6 +1442,47 @@ class WebResearcher:
         if isinstance(value, list):
             return [str(item) for item in value if item]
         return [str(value)] if value else []
+
+    @staticmethod
+    def _observed_values(text: str, requested_values: list[str]) -> list[str]:
+        """Keep request terms only when the fetched evidence actually mentions them."""
+
+        normalized_text = re.sub(r"\s+", " ", str(text or "").casefold())
+        observed: list[str] = []
+        for value in requested_values:
+            cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+            if cleaned and cleaned.casefold() in normalized_text and cleaned not in observed:
+                observed.append(cleaned)
+        return observed
+
+    @classmethod
+    def _observed_product_values(cls, text: str, intent: ProcurementIntent) -> list[str]:
+        """Return product-family evidence, never geography or certification tokens."""
+
+        normalized_text = re.sub(r"\s+", " ", str(text or "").casefold())
+        observed: list[str] = []
+        for term in cls.CATEGORY_PRODUCT_TERMS.get(intent.category or "", ()):
+            if term in normalized_text and term not in observed:
+                observed.append(term)
+
+        if observed:
+            return observed[:5]
+
+        certification_values = {value.casefold() for value in intent.certifications}
+        country_value = str(intent.country or "").casefold()
+        for value in intent.keywords:
+            cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+            lowered = cleaned.casefold()
+            if (
+                not cleaned
+                or lowered in certification_values
+                or lowered == country_value
+                or re.fullmatch(r"(?:iatf|iso|\d{2,5}|iatf\s*\d+|iso\s*\d+)", lowered)
+            ):
+                continue
+            if lowered in normalized_text and cleaned not in observed:
+                observed.append(cleaned)
+        return observed[:5]
 
     @staticmethod
     def clean_text(text: str) -> str:

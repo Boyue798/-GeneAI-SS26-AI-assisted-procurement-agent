@@ -1,0 +1,176 @@
+.sourcing-criteria {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--proc-line);
+  border-radius: 10px;
+  background: var(--proc-surface-muted);
+}
+
+.sourcing-criteria__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.sourcing-criteria__header h3 {
+  margin: 0;
+  color: var(--proc-ink);
+  font-size: 0.875rem;
+  font-weight: 750;
+}
+
+.sourcing-criteria__header p {
+  max-width: 72ch;
+  margin: 0.25rem 0 0;
+  color: var(--proc-muted);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.sourcing-criteria__total {
+  flex: 0 0 auto;
+  padding: 0.25rem 0.45rem;
+  border: 1px solid var(--proc-cobalt-line);
+  border-radius: 5px;
+  background: var(--proc-cobalt-soft);
+  color: var(--proc-cobalt-strong);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 750;
+}
+
+.sourcing-criteria__rows {
+  display: grid;
+  gap: 0.45rem;
+  margin-top: 0.9rem;
+}
+
+.sourcing-criteria__row {
+  display: grid;
+  grid-template-columns: minmax(7.5rem, 0.85fr) minmax(6rem, 1.4fr) 3.3rem 0.7rem auto;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.sourcing-criteria__row label {
+  overflow: hidden;
+  color: var(--proc-ink-soft);
+  font-size: 0.75rem;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sourcing-criteria__row input[type='range'] {
+  width: 100%;
+  accent-color: var(--proc-cobalt);
+}
+
+.sourcing-criteria__row input[type='number'] {
+  width: 100%;
+  min-height: 1.95rem;
+  box-sizing: border-box;
+  padding: 0.25rem 0.35rem;
+  border: 1px solid var(--proc-line);
+  border-radius: 6px;
+  background: var(--proc-surface);
+  color: var(--proc-ink);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.sourcing-criteria__row > span {
+  color: var(--proc-muted);
+  font-size: 0.75rem;
+}
+
+.sourcing-criteria__row button,
+.sourcing-criteria__add-row button,
+.sourcing-criteria__presets button {
+  border: 1px solid var(--proc-line);
+  border-radius: 6px;
+  background: var(--proc-surface);
+  color: var(--proc-cobalt-strong);
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-weight: 650;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, transform 120ms ease;
+}
+
+.sourcing-criteria__row button {
+  min-height: 1.95rem;
+  padding: 0.25rem 0.45rem;
+}
+
+.sourcing-criteria__row button:hover,
+.sourcing-criteria__add-row button:hover,
+.sourcing-criteria__presets button:hover:not(:disabled) {
+  border-color: var(--proc-cobalt);
+  background: var(--proc-cobalt-soft);
+}
+
+.sourcing-criteria__row button:active,
+.sourcing-criteria__add-row button:active,
+.sourcing-criteria__presets button:active {
+  transform: translateY(1px);
+}
+
+.sourcing-criteria__add-row {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.9rem;
+}
+
+.sourcing-criteria__add-row .procurement-input {
+  min-width: 0;
+  flex: 1;
+  min-height: 2.25rem;
+  padding: 0.4rem 0.55rem;
+  border-width: 1px;
+  border-style: solid;
+  font-size: 0.75rem;
+}
+
+.sourcing-criteria__add-row button {
+  padding: 0.4rem 0.65rem;
+  white-space: nowrap;
+}
+
+.sourcing-criteria__presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.55rem;
+}
+
+.sourcing-criteria__presets button {
+  padding: 0.3rem 0.45rem;
+}
+
+.sourcing-criteria__presets button:disabled {
+  border-color: transparent;
+  background: transparent;
+  color: var(--proc-muted);
+  cursor: default;
+  text-decoration: line-through;
+}
+
+@media (max-width: 640px) {
+  .sourcing-criteria__row {
+    grid-template-columns: 1fr 3.3rem 0.7rem auto;
+  }
+
+  .sourcing-criteria__row label {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sourcing-criteria__row button,
+  .sourcing-criteria__add-row button,
+  .sourcing-criteria__presets button {
+    transition: none;
+  }
+}

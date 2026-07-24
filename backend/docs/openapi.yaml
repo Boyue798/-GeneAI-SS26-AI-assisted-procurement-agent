@@ -33,6 +33,7 @@ tags:
   - name: Auth
   - name: Vault
   - name: Sourcing
+  - name: Suppliers
   - name: Comparison
   - name: Conversations
 
@@ -212,6 +213,85 @@ paths:
             text/event-stream:
               schema:
                 type: string
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /api/suppliers:
+    get:
+      tags: [Suppliers]
+      summary: List the managed local supplier directory
+      description: >
+        Returns the PostgreSQL supplier directory when available, otherwise the
+        persistent local JSON fallback used by desktop/offline mode.
+      parameters:
+        - name: query
+          in: query
+          schema: { type: string }
+        - name: country
+          in: query
+          schema: { type: string }
+        - name: origin
+          in: query
+          schema: { type: string, enum: [internal, web] }
+        - name: tag
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Supplier directory entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SupplierDirectoryEntry' }
+    post:
+      tags: [Suppliers]
+      summary: Add a managed local supplier
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SupplierDirectoryCreate' }
+      responses:
+        '201':
+          description: Created supplier
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierDirectoryEntry' }
+
+  /api/suppliers/{supplier_id}:
+    patch:
+      tags: [Suppliers]
+      summary: Edit a managed local supplier
+      parameters:
+        - name: supplier_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SupplierDirectoryUpdate' }
+      responses:
+        '200':
+          description: Updated supplier
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierDirectoryEntry' }
+        '404':
+          $ref: '#/components/responses/Error'
+    delete:
+      tags: [Suppliers]
+      summary: Remove a managed local supplier
+      parameters:
+        - name: supplier_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Deleted
         '404':
           $ref: '#/components/responses/Error'
 
@@ -475,6 +555,11 @@ components:
           example: Water deflector strips and glass adhesive in Germany
         structured:
           $ref: '#/components/schemas/SourcingStructuredFields'
+        criteria:
+          type: array
+          maxItems: 12
+          description: User-configurable supplier evaluation dimensions and weights.
+          items: { $ref: '#/components/schemas/EvaluationCriterion' }
 
     SourcingStructuredFields:
       type: object
@@ -484,9 +569,27 @@ components:
         quantity: { type: string }
         unit: { type: string }
         brand: { type: string }
+        model: { type: string }
+        specifications: { type: string }
+        standards: { type: string, description: 'Comma-separated standards / certifications' }
         category: { type: string }
         country: { type: string }
+        targetRegion: { type: string }
         certifications: { type: string }
+        minOrderQuantity: { type: string }
+        qualityRequirements: { type: string }
+        environmentalRequirements: { type: string }
+
+    EvaluationCriterion:
+      type: object
+      required: [key, weight]
+      properties:
+        key:
+          type: string
+          description: Stable machine key, e.g. quality, reputation, minimumOrderQuantity, environmental.
+          pattern: '^[A-Za-z][A-Za-z0-9_-]*$'
+        label: { type: string }
+        weight: { type: number, minimum: 0, maximum: 100 }
 
     SupplierCategory:
       type: string
@@ -517,11 +620,118 @@ components:
         certifications:
           type: array
           items: { type: string }
+        productName: { type: string, nullable: true }
+        brand: { type: string, nullable: true }
+        model: { type: string, nullable: true }
+        specifications: { type: string, nullable: true }
+        standards:
+          type: array
+          items: { type: string }
+        unitPriceEur: { type: number, nullable: true }
+        unitPrice: { type: number, nullable: true, description: 'Compatibility alias for unitPriceEur' }
+        currency: { type: string, example: EUR }
+        unitLabel: { type: string }
+        quoteConditions: { type: string, nullable: true }
+        deliveryDays: { type: integer, nullable: true }
+        deliveryLabel: { type: string }
+        deliveryLeadTime: { type: string, description: 'Compatibility alias for deliveryLabel' }
+        paymentTerm: { type: string, nullable: true }
+        paymentLabel: { type: string }
+        paymentTerms: { type: string, description: 'Compatibility alias for paymentLabel' }
+        source: { type: string, enum: [database, web] }
+        sourceDetail: { type: string }
+        sourceUrls:
+          type: array
+          items: { type: string }
+        evidenceSnippets:
+          type: array
+          items: { type: string }
+        verificationStatus: { type: string, enum: [verified, needs-review] }
+        verificationNotes:
+          type: array
+          items: { type: string }
+        dataCompleteness: { type: number, minimum: 0, maximum: 100 }
+        criteriaScores:
+          type: object
+          additionalProperties: { type: number, minimum: 0, maximum: 100 }
+        weightedCriteriaScore: { type: number, minimum: 0, maximum: 100 }
         matchScore:
           type: number
           minimum: 0
           maximum: 100
           description: Relevance to the query (0–100)
+
+    SupplierDirectoryFields:
+      type: object
+      properties:
+        origin: { type: string, enum: [internal, web], default: internal }
+        category: { type: string, default: general }
+        productName: { type: string, nullable: true }
+        brand: { type: string, nullable: true }
+        model: { type: string, nullable: true }
+        specifications: { type: string, nullable: true }
+        standards: { type: array, items: { type: string } }
+        country: { type: string, nullable: true }
+        city: { type: string, nullable: true }
+        address: { type: string, nullable: true }
+        website: { type: string, nullable: true }
+        contactPerson: { type: string, nullable: true }
+        email: { type: string, nullable: true }
+        phone: { type: string, nullable: true }
+        employees: { type: string, nullable: true }
+        annualRevenue: { type: string, nullable: true }
+        established: { type: integer, nullable: true }
+        products: { type: array, items: { type: string } }
+        capabilities: { type: array, items: { type: string } }
+        certifications: { type: array, items: { type: string } }
+        tags: { type: array, items: { type: string } }
+        preferred: { type: boolean }
+        historicalPerformance: { type: string, nullable: true }
+        notes: { type: string, nullable: true }
+        minimumOrderQuantity: { type: string, nullable: true }
+        productionCapacity: { type: string, nullable: true }
+        environmentalStandards: { type: array, items: { type: string } }
+        criteriaScores:
+          type: object
+          additionalProperties: { type: number, minimum: 0, maximum: 100 }
+        unitPriceEur: { type: number, nullable: true }
+        quoteConditions: { type: string, nullable: true }
+        deliveryDays: { type: integer, nullable: true }
+        deliveryLabel: { type: string, nullable: true }
+        paymentTerm: { type: string, nullable: true }
+        paymentLabel: { type: string, nullable: true }
+        rating: { type: number, minimum: 0, maximum: 5, nullable: true }
+
+    SupplierDirectoryCreate:
+      allOf:
+        - $ref: '#/components/schemas/SupplierDirectoryFields'
+        - type: object
+          required: [name]
+          properties:
+            name: { type: string }
+
+    SupplierDirectoryUpdate:
+      allOf:
+        - $ref: '#/components/schemas/SupplierDirectoryFields'
+        - type: object
+          properties:
+            name: { type: string }
+
+    SupplierDirectoryEntry:
+      allOf:
+        - $ref: '#/components/schemas/SupplierDirectoryFields'
+        - type: object
+          required: [id, name, origin, source, sourceDetail, matchScore, createdAt, updatedAt]
+          properties:
+            id: { type: string }
+            name: { type: string }
+            source: { type: string, enum: [database] }
+            sourceDetail: { type: string, enum: [internal, web] }
+            matchScore: { type: number, minimum: 0, maximum: 100 }
+            sourceUrls: { type: array, items: { type: string } }
+            verificationStatus: { type: string, enum: [verified, needs-review] }
+            createdAt: { type: integer, format: int64 }
+            updatedAt: { type: integer, format: int64 }
 
     SearchJobEvent:
       type: object
@@ -626,7 +836,14 @@ components:
         evidenceSnippets:
           type: array
           items: { type: string }
-        priceConfidence: { type: string, enum: [extracted, unknown] }
+        priceConfidence: { type: string, enum: [api, extracted, unknown] }
+        criteriaScores:
+          type: object
+          additionalProperties: { type: number, minimum: 0, maximum: 100 }
+        weightedCriteriaScore: { type: number, minimum: 0, maximum: 100, nullable: true }
+        appliedCriteria:
+          type: array
+          items: { $ref: '#/components/schemas/EvaluationCriterion' }
 
     DeliveryOption:
       type: string
@@ -637,10 +854,19 @@ components:
       required: [query]
       properties:
         query: { type: string }
+        country:
+          type: string
+          nullable: true
+          description: Optional target Google Shopping market, for example Germany or Poland.
         minPrice: { type: number, description: 'Optional hard filter (EUR)' }
         maxPrice: { type: number, description: 'Optional hard filter (EUR)' }
         deliveryTime: { $ref: '#/components/schemas/DeliveryOption' }
         weights: { $ref: '#/components/schemas/FactorWeights' }
+        criteria:
+          type: array
+          maxItems: 12
+          description: Optional user-defined quote decision dimensions and weights.
+          items: { $ref: '#/components/schemas/EvaluationCriterion' }
 
     FactorWeights:
       type: object
@@ -677,9 +903,24 @@ components:
         quantity: { type: string }
         unit: { type: string }
         brand: { type: string }
+        model: { type: string }
+        specifications: { type: string }
+        standards: { type: string }
         structuredCategory: { type: string }
         structuredCountry: { type: string }
         structuredCerts: { type: string }
+        criteria:
+          type: array
+          description: Custom sourcing or comparison criteria retained when reopening the request.
+          items: { $ref: '#/components/schemas/EvaluationCriterion' }
+        sourcingCriteria:
+          type: array
+          description: Backwards-compatible sourcing-specific custom criteria.
+          items: { $ref: '#/components/schemas/EvaluationCriterion' }
+        comparisonCriteria:
+          type: array
+          description: Backwards-compatible comparison-specific custom criteria.
+          items: { $ref: '#/components/schemas/EvaluationCriterion' }
 
     NewConversation:
       type: object

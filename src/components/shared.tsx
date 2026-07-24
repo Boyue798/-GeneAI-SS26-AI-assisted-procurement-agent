@@ -13,7 +13,7 @@ export function StepIndicator({
 }) {
   const totalSteps = steps.length
   return (
-    <div className="flex items-center justify-between">
+    <div className="procurement-steps flex items-center justify-between">
       {steps.map((label, index) => {
         const stepNum = index + 1
         const isCompleted = stepNum < currentStep || (stepNum === currentStep && currentStep === totalSteps)
@@ -22,12 +22,8 @@ export function StepIndicator({
         const connectorFilled = stepNum < currentStep || (stepNum === currentStep && currentStep === totalSteps)
         return (
           <div key={label} className="flex flex-1 items-center">
-            <div className="flex flex-col items-center gap-2">
-              <div
-                className={`flex h-10 w-10 items-center justify-center rounded-full text-sm font-semibold transition-all duration-300 ${
-                  isCompleted || isInProgress ? 'bg-blue-600 text-white' : 'border border-gray-200 bg-gray-100 text-gray-400'
-                }`}
-              >
+            <div className={`procurement-step flex flex-col items-center gap-2 ${isCompleted ? 'is-complete' : isInProgress ? 'is-active' : ''}`}>
+              <div className="procurement-step__number flex items-center justify-center text-sm font-semibold transition-all duration-300">
                 {isCompleted ? (
                   <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
@@ -36,19 +32,13 @@ export function StepIndicator({
                   stepNum
                 )}
               </div>
-              <span
-                className={`max-w-[140px] text-center text-xs font-medium ${
-                  isCompleted ? 'text-blue-600' : isInProgress ? 'text-blue-700' : 'text-gray-400'
-                }`}
-              >
+              <span className="procurement-step__label max-w-[140px] text-center font-medium">
                 {label}
               </span>
             </div>
             {!isLast && (
               <div
-                className={`mx-4 mb-6 h-0.5 flex-1 transition-colors duration-300 ${
-                  connectorFilled ? 'bg-blue-600' : 'bg-gray-200'
-                }`}
+                className={`procurement-step__connector mx-4 mb-6 flex-1 transition-colors duration-300 ${connectorFilled ? 'is-filled' : ''}`}
               />
             )}
           </div>
@@ -66,7 +56,7 @@ export function MatchScoreBadge({ score }: { score: number }) {
         ? 'bg-blue-50 text-blue-700 ring-blue-600/20'
         : 'bg-slate-50 text-slate-600 ring-slate-500/20'
   return (
-    <div className="flex items-center gap-3">
+    <div className="comparison-score flex items-center gap-3">
       <div className="h-2 w-20 overflow-hidden rounded-full bg-slate-100">
         <div className="h-full rounded-full bg-blue-600 transition-all" style={{ width: `${score}%` }} />
       </div>
@@ -106,12 +96,12 @@ export function ExportPrintToolbar({
   }
 
   return (
-    <div className="flex flex-wrap items-center gap-2 print:hidden">
+    <div className="procurement-toolbar flex flex-wrap items-center print:hidden">
       <button
         type="button"
         onClick={handleExport}
         disabled={isExporting || rows.length === 0}
-        className="inline-flex items-center gap-2 rounded-lg border border-blue-200 bg-white px-4 py-2 text-sm font-medium text-blue-600 shadow-sm transition-all hover:border-blue-300 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-70"
+        className="procurement-toolbar__export inline-flex items-center gap-2 border px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-70"
       >
         {isExporting ? (
           <>
@@ -130,7 +120,7 @@ export function ExportPrintToolbar({
       <button
         type="button"
         onClick={() => window.print()}
-        className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white shadow-md shadow-blue-600/20 transition-all hover:bg-blue-700"
+        className="procurement-toolbar__print inline-flex items-center gap-2 px-4 py-2 text-sm font-medium"
       >
         <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
           <path strokeLinecap="round" strokeLinejoin="round" d="M6.72 13.829c-.24.03-.48.062-.72.096m.72-.096a42.415 42.415 0 0110.56 0m-10.56 0L6.34 18m10.94-4.171c.24.03.48.062.72.096m-.72-.096L17.66 18M6.34 18H17.66M6.34 18v-2.25c0-1.036.84-1.875 1.875-1.875h11.25c1.035 0 1.875.84 1.875 1.875V18M9 6.75V4.875C9 3.84 9.84 3 10.875 3h2.25C14.16 3 15 3.84 15 4.875V6.75" />
@@ -144,7 +134,7 @@ export function ExportPrintToolbar({
 /** Banner shown when results are restored from conversation history. */
 export function RestoredBanner({ t }: { t: Translation }) {
   return (
-    <div className="flex items-center gap-3 rounded-xl border border-blue-200 bg-blue-50 px-5 py-3 text-sm text-blue-800 shadow-sm print:hidden">
+    <div className="procurement-notice flex items-center gap-3 border px-5 py-3 text-sm print:hidden">
       <svg className="h-5 w-5 shrink-0 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
       </svg>
@@ -167,7 +157,7 @@ export function AnalyzeButton({
       type="button"
       onClick={onClick}
       disabled={isAnalyzing}
-      className="inline-flex shrink-0 items-center gap-2 rounded-lg bg-blue-600 px-6 py-2.5 text-sm font-semibold text-white shadow-md shadow-blue-600/25 transition-all hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-70"
+      className="procurement-primary-action inline-flex shrink-0 items-center gap-2 px-6 py-2.5 text-sm font-semibold text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-70"
     >
       {isAnalyzing ? (
         <>
